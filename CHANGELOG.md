@@ -2,6 +2,9 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/).
 
+## [v3.11] — 2026-11-16
+O instalador desliga as teclas de acesso aos menus do terminal (`ShortcutsNoMnemonics`), para o Alt+A e o Alt+E chegarem ao AdaShell em vez de abrir os menus Arquivo/Editar
+
 ## [v3.10] — 2026-11-16
 `smart explain`, `smart ask`, `smart fix` e `smart learn explain/ask/fix` passam a funcionar (com dica do jeito curto); mensagem de "aula não encontrada" sugere `explain`
 

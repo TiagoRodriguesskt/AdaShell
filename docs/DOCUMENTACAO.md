@@ -2,7 +2,7 @@
 
 Um terminal no estilo do AdaOS que entende português, explica comandos, corrige erros e sugere enquanto você digita. Roda no Debian 12/13 com Xfce. A IA fica no próprio notebook (Ollama): depois de baixada, nada vai para a internet.
 
-Criado em 13/11/2026 (kit v1); atualizado em 13/11/2026 (kit v3.10, `explain` aceito também como `smart explain` e `smart learn explain`). Testado com Fish 3.7 e uma IA simulada; o `smart update` foi testado no notebook (Debian 12) em 13/11/2026 e atualizou tudo.
+Criado em 13/11/2026 (kit v1); atualizado em 13/11/2026 (kit v3.11, Alt+A/Alt+E não abrem mais os menus do terminal). Testado com Fish 3.7 e uma IA simulada; o `smart update` foi testado no notebook (Debian 12) em 13/11/2026 e atualizou tudo.
 
 ## Cola rápida (para decorar)
 
@@ -901,6 +901,8 @@ Ideias para praticar Python: mudar a gravidade para a da Lua (g ÷ 6) num "modo 
 
 `ask` ou Alt+A? O `ask` mostra a explicação e o risco e pergunta antes de rodar. O Alt+A só coloca o comando na linha: mais rápido, e você revisa antes do Enter.
 
+> Se o Alt+A ou o Alt+E **abrirem um menu do terminal** (Arquivo/Editar) em vez de funcionar, o terminal do Xfce está usando Alt+letra para os menus. O `instalar.sh` já desliga isso; para resolver na mão, veja "Problemas comuns".
+
 ## 6. Recursos que funcionam sem IA
 
 Mesmo sem o Ollama, ou com ele desligado:
@@ -1076,7 +1078,7 @@ Fonte: **JetBrains Mono 11**.
 | A IA demora muito | Normal na primeira pergunta (o modelo carrega na memória). Se continuar lento, use o `3b` |
 | Terminal não abriu no Fish | Feche **todas** as janelas do terminal e abra de novo. Ou: Editar → Preferências → Geral → "Executar um comando personalizado" → `/usr/bin/fish` |
 | Prompt sem cores/símbolos estranhos | Confira se o starship existe: `ls ~/.local/bin/starship`. Se não, rode o `instalar.sh` de novo |
-| Alt+A não faz nada | O Xfce pode estar usando o Alt+A. Teste `ask` primeiro; para trocar o atalho, edite `fish_user_key_bindings.fish` |
+| **Alt+A ou Alt+E abre um menu do terminal** (Arquivo/Editar) | O terminal do Xfce usa Alt+letra para os menus. Correção rápida: **Editar → Preferências → Avançado →** marque **"Desativar todas as teclas de acesso ao menu (como Alt+f)"**. O `instalar.sh` (v3.11+) já faz isso sozinho (opção `ShortcutsNoMnemonics`) |
 | Ctrl+R não abre o fzf | `sudo apt install fzf` e abra o terminal de novo |
 | `ll` sem cores do Git | Instale o `exa` (Debian 12) ou `eza` (Debian 13) |
 | A sugestão da IA está errada | Use `explain` no comando, reformule o pedido com mais detalhes ou use o modelo `7b` |
@@ -1158,6 +1160,7 @@ Depois de editar, abra um terminal novo para testar. Para editar o kit e reinsta
 
 | Versão | O que mudou |
 | --- | --- |
+| v3.11 (16/11/2026) | O instalador desliga as teclas de acesso aos menus do terminal (`ShortcutsNoMnemonics`), para o Alt+A e o Alt+E chegarem ao AdaShell em vez de abrir os menus Arquivo/Editar |
 | v3.10 (16/11/2026) | `smart explain`, `smart ask`, `smart fix` e `smart learn explain/ask/fix` passam a funcionar (com dica do jeito curto); mensagem de "aula não encontrada" sugere `explain` |
 | v3.9 (16/11/2026) | `smart learn` conferido: busca acerta a palavra exata (`ip` não abre mais "pipe") e entende palavras do dia a dia; não quebra com progresso corrompido; mensagem ao terminar as 27 aulas; aulas corrigidas: 6 (o `/var/log/syslog` não existe no Debian 12 → `tail -f arquivo.log`), 12 (exercício do `history` no fish e no bash), 13 (linha `#!/bin/bash`), 18 (fish e bash separados), 19 (atalhos com ⌨), 26 (`xargs` seguro com espaços) |
 | v3.8 (16/11/2026) | `smart dino`: mudar o tamanho da janela no meio da partida pausa e ajusta o jogo **sem perder a pontuação** (antes a partida recomeçava do zero) |

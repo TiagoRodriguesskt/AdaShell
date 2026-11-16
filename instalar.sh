@@ -176,6 +176,8 @@ c["FontUseSystem"] = "FALSE"
 c["FontName"] = "JetBrains Mono 11"
 c["RunCustomCommand"] = "TRUE"
 c["CustomCommand"] = fish
+# Sem isto, o Alt+A/Alt+E abririam os menus Arquivo/Editar do terminal
+c["ShortcutsNoMnemonics"] = "TRUE"
 with open(rc_path, "w") as f:
     rc.write(f, space_around_delimiters=False)
 EOF
@@ -192,8 +194,9 @@ if command -v xfconf-query >/dev/null 2>&1 && \
     xq /font-name string "JetBrains Mono 11"
     xq /run-custom-command bool true
     xq /custom-command string "$FISH_BIN"
+    xq /shortcuts-no-mnemonics bool true
 fi
-ok "feche e abra o terminal para ver"
+ok "cores, fonte, fish e Alt+A/Alt+E liberados — feche e abra o terminal"
 
 # ---------------------------------------------------------------------------
 etapa 8 "IA local (Ollama) — opcional, ~2 GB"
