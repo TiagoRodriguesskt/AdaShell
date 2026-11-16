@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""adaos-dino — jogo de corrida no terminal (Terminal Inteligente / AdaOS).
+
+Um dinossauro steampunk (cartola e óculos de aviador) corre por um mundo de
+engrenagens. Pule os cactos e as engrenagens, abaixe dos pássaros mecânicos.
+
+Controles:  Espaço / ↑ / w  pular      ↓ / s  abaixar (no ar: cai mais rápido)
+            p  pausar      m  som liga/desliga      q  sair
+
+Só usa a biblioteca padrão do Python (curses). Para estudar:
+  • update()        a física: gravidade e pulo (MRUV, igual ao da escola)
+  • collides()      colisão caractere por caractere
+  • spawn()         como os obstáculos aparecem sem ficar impossível
+"""
+
+import curses
+import json
+import random
+import sys
+import time
+from pathlib import Path
+
+RECORD_FILE = Path.home() / ".config" / "adaos" / "dino.json"
+MIN_W, MIN_H = 64, 20
+FPS = 60
+
+# ----------------------------------------------------------------------------
+# Física (unidades: linhas e colunas do terminal por segundo)
+# ----------------------------------------------------------------------------
+# Pulo calibrado pelo jogo original do Chrome (classe Trex do Chromium):
+#   GRAVITY = 0.6 px/quadro², INITIAL_JUMP_VELOCITY = 10 px/quadro, 60 fps,
+#   SPEED_DROP_COEFFICIENT = 3  ->  no ar 0,556 s, altura = 1,77× o dinossauro
+# Aqui: o MESMO tempo no ar e a MESMA proporção de altura, se a janela couber.
+# Em janelas baixas, a altura diminui (o tempo no ar continua 0,556 s).
+#   h = v0² / (2g)   t = 2·v0 / g   ->   g = 8h / t²   e   v0 = g·t / 2
+AIR_TIME = 0.556         # segundos no ar (Chrome)
+JUMP_RATIO = 1.77        # altura do pulo ÷ altura do dino (Chrome)
+DINO_HEIGHT = 6          # linhas
+FALL_BOOST = 1.0         # Chrome: mesma gravidade na subida e na descida
+FAST_FALL = 3.0          # Chrome: SPEED_DROP_COEFFICIENT (↓ no ar)
+
+
+def jump_physics(ground_row):
+    """Altura, gravidade e velocidade inicial do pulo para este tamanho de janela."""
+    height = max(3.0, min(JUMP_RATIO * DINO_HEIGHT, ground_row - DINO_HEIGHT - 2))
+    gravity = 8 * height / AIR_TIME ** 2
+    speed = gravity * AIR_TIME / 2
+    return height, gravity, speed
+
+
+START_SPEED = 30.0       # colunas por segundo
+MAX_SPEED = 72.0
+DUCK_FIRST = 0.45        # 1º toque em ↓: fica abaixado até o teclado começar a repetir
+DUCK_REPEAT = 0.12       # enquanto você segura ↓ (repetição): solta -> levanta em 0,12 s
+JUMP_BUFFER = 0.15       # apertou pular até 0,15 s antes de pousar? pula ao pousar
+BIRD_SPEED = 1.08        # pássaros voam 8% mais rápido que o chão
+BIRD_EXTRA_GAP = 1.6     # espaço extra antes de um pássaro (para pousar e reagir)
+
+# ----------------------------------------------------------------------------
+# Desenhos (personagem original do AdaOS). Espaço = transparente.
+# ----------------------------------------------------------------------------
+DINO_RUN = [
+    [
+        "      ▄█▄  ",
+        "     ▀▀▀▀▀ ",
+        "    █◉████▄",
+        "▄  ▄████▀▀ ",
+        "▀█▄█████▄  ",
+        "   █▀  ▀█  ",
+    ],
+    [
+        "      ▄█▄  ",
+        "     ▀▀▀▀▀ ",
+        "    █◉████▄",
+        "▄  ▄████▀▀ ",
+        "▀█▄█████▄  ",
+        "   ▀█  █▀  ",
+    ],
+]
+DINO_JUMP = [
+    "      ▄█▄  ",
+    "     ▀▀▀▀▀ ",
+    "    █◉████▄",
+    "▄  ▄████▀▀ ",
+    "▀█▄█████▄  ",
+    "   █▌  ▐█  ",
+]
+DINO_DUCK = [
+    [
+        "▄      ▄▄▀▀▀▄▄  ",
+        "▀█▄▄▄▄██◉█████▄▄",
+        "   █▀  ▀█▀▀▀    ",
+    ],
+    [
+        "▄      ▄▄▀▀▀▄▄  ",
+        "▀█▄▄▄▄██◉█████▄▄",
+        "   ▀█  █▀▀▀▀    ",
+    ],
+]
+DINO_DEAD = [
+    "      ▄█▄  ",
+    "     ▀▀▀▀▀ ",
+    "    █✕████▄",
+    "▄  ▄████▀▀ ",
+    "▀█▄█████▄  ",
+    "   █▀  ▀█  ",
+]
+
+OBSTACLES = {
+    "cactus_small": [
+        " ▄ ",
+        "▐█▌",
+        " █ ",
+    ],
+    "cactus_big": [
+        "  █  ",
+        "█ █ █",
+        "▀▄█▄▀",
+        "  █  ",
+    ],
+    "gear": [
+        "▄█▀█▄",
+        "▀█◎█▀",
+    ],
+    "gear_big": [
+        "▄▀█▀▄",
+        "█ ◎ █",
+        "▀▄█▄▀",
+    ],
+}
+BIRD = [
+    [
+        "   ▄▀    ",
+        "◁◉██▀▀▀▄▄",
+    ],
+    [
+        "◁◉██▀▀▀▄▄",
+        "   ▀▄    ",
+    ],
+]
+CLOUD = [
+    "   ▄▄▄▄     ",
+    " ▄█████▄▄▄  ",
+    "▀▀▀▀▀▀▀▀▀▀▀ ",
+]
+MOUNTAIN = "      ▄▀▀▄           ▄▀▄          ▄▀▀▀▄        ▄▀▄    "
+SOLID = set("█◉◎▌▐◁✕")  # só estes contam na colisão (meio-blocos ▄▀ perdoam)
+
+
+def air_time():
+    """Tempo total no ar (igual em qualquer tamanho de janela)."""
+    return AIR_TIME
+
+
+def keyboard_repeat():
+    """Lê a espera e a velocidade de repetição do teclado (xset q)."""
+    global DUCK_FIRST, DUCK_REPEAT
+    import os
+    import re
+    import subprocess
+    if not os.environ.get("DISPLAY"):
+        return
+    try:
+        out = subprocess.run(["xset", "q"], capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    m = re.search(r"auto repeat delay:\s*(\d+)\s+repeat rate:\s*(\d+)", out)
+    if m:
+        delay, rate = int(m.group(1)) / 1000, max(1, int(m.group(2)))
+        DUCK_FIRST = min(0.75, max(0.3, delay + 0.08))
+        DUCK_REPEAT = max(0.08, min(0.2, 3.0 / rate))
+
+
+def mask(sprite):
+    """Células sólidas de um desenho: [(linha, coluna), ...]."""
+    return [(r, c) for r, line in enumerate(sprite) for c, ch in enumerate(line) if ch in SOLID]
+
+
+# ----------------------------------------------------------------------------
+# Cores do AdaOS
+# ----------------------------------------------------------------------------
+C = {}
+
+
+def init_colors():
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    rich = curses.COLORS >= 256
+    palette = {
+        # nome: (cor 256, cor básica)
+        "bronze": (179, curses.COLOR_YELLOW),
+        "bronze2": (222, curses.COLOR_YELLOW),
+        "emerald": (36, curses.COLOR_GREEN),
+        "wine": (167, curses.COLOR_RED),
+        "ivory": (230, curses.COLOR_WHITE),
+        "grey": (242, curses.COLOR_WHITE),
+        "dark": (238, curses.COLOR_BLUE),
+        "star": (250, curses.COLOR_WHITE),
+        "moon": (229, curses.COLOR_YELLOW),
+        "blue": (74, curses.COLOR_CYAN),
+    }
+    for i, (name, (c256, c8)) in enumerate(palette.items(), start=1):
+        curses.init_pair(i, c256 if rich else c8, bg)
+        C[name] = curses.color_pair(i)
+
+
+# ----------------------------------------------------------------------------
+# Recorde
+# ----------------------------------------------------------------------------
+def load_record():
+    try:
+        return json.loads(RECORD_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"record": 0, "games": 0, "jumps": 0, "seconds": 0}
+
+
+def save_record(data):
+    try:
+        RECORD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RECORD_FILE.write_text(json.dumps(data))
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# O jogo
+# ----------------------------------------------------------------------------
+class Game:
+    def __init__(self, scr, stats):
+        self.scr = scr
+        self.stats = stats
+        self.sound = False
+        self.reset()
+
+    def reset(self):
+        h, w = self.scr.getmaxyx()
+        self.w, self.h = w, h
+        self.ground = h - 4                   # linha do chão
+        self.jump_height, self.gravity, self.jump_speed = jump_physics(self.ground)
+        self.x = 6                            # coluna do dinossauro
+        self.y = 0.0                          # altura acima do chão (linhas)
+        self.vy = 0.0                         # velocidade vertical
+        self.duck_until = 0.0
+        self.last_duck_key = -1.0
+        self.fast_fall = False
+        self.speed = START_SPEED
+        self.score = 0.0
+        self.obstacles = []                   # dicionários: tipo, x, elev, sprite
+        self.since_spawn = 0.0
+        self.next_gap = 40.0
+        self.clouds = [[random.uniform(0, w), random.randint(1, max(2, self.ground - 10))]
+                       for _ in range(3)]
+        self.stars = [(random.randint(0, w - 2), random.randint(1, max(2, self.ground - 8)),
+                       random.choice("·˙✦."))
+                      for _ in range(max(8, w // 6))]
+        self.mountain_x = 0.0
+        self.ground_x = 0.0
+        self.pebbles = [(random.randint(0, 400), random.choice("·.˙,'")) for _ in range(60)]
+        self.state = "start"                  # start, run, pause, over
+        self.t_anim = 0.0
+        self.flash_until = 0.0
+        self.last_milestone = 0
+        self.jumps = 0
+        self.run_time = 0.0
+        self.new_record = False
+        self.over_at = 0.0
+        self.now = time.monotonic()
+        self.jump_buffer_until = 0.0
+        self.next_kind = "cactus_small"
+        self.resized = False
+
+    def resize(self):
+        """A janela mudou de tamanho: ajusta tudo SEM perder a partida.
+
+        Mantém pontuação, velocidade e obstáculos; recalcula o chão, o pulo
+        (que depende da altura da janela) e o céu. O dino é posto no chão,
+        porque a gravidade do pulo muda com a altura.
+        """
+        h, w = self.scr.getmaxyx()
+        self.w, self.h = w, h
+        self.ground = h - 4
+        self.jump_height, self.gravity, self.jump_speed = jump_physics(self.ground)
+        self.y, self.vy, self.fast_fall = 0.0, 0.0, False
+        self.jump_buffer_until = 0.0
+        self.clouds = [[random.uniform(0, w), random.randint(1, max(2, self.ground - 10))]
+                       for _ in range(3)]
+        self.stars = [(random.randint(0, max(1, w - 2)), random.randint(1, max(2, self.ground - 8)),
+                       random.choice("·˙✦."))
+                      for _ in range(max(8, w // 6))]
+        self.resized = True
+
+    # ---- entrada --------------------------------------------------------
+    def jump(self):
+        if self.state != "run":
+            return
+        if self.y <= 0.0:
+            self._do_jump()
+        else:
+            # Ainda no ar: guarda o pedido e pula assim que encostar no chão
+            self.jump_buffer_until = self.now + JUMP_BUFFER
+
+    def _do_jump(self):
+        self.vy = self.jump_speed
+        self.duck_until = 0.0
+        self.jump_buffer_until = 0.0
+        self.jumps += 1
+        self.beep()
+
+    def duck(self, now):
+        """O terminal só avisa quando a tecla é APERTADA (nunca quando é solta).
+
+        Segurando ↓, o teclado repete o sinal (~30 vezes por segundo, depois
+        de uma espera inicial). Então: no 1º sinal fica abaixado até a
+        repetição começar; nos sinais repetidos, só mais um instante. Ao soltar,
+        os sinais param e o dino levanta quase na hora.
+        """
+        self.now = now
+        if self.y > 0.0:
+            self.fast_fall = True             # no ar: cai mais rápido
+            return
+        repeating = now - self.last_duck_key < 0.15
+        self.duck_until = now + (DUCK_REPEAT if repeating else DUCK_FIRST)
+        self.last_duck_key = now
+
+    def beep(self):
+        if self.sound:
+            curses.beep()
+
+    @property
+    def ducking(self):
+        return self.y <= 0.0 and self.now < self.duck_until
+
+    def dino_sprite(self):
+        frame = int(self.t_anim * 12) % 2     # 12 trocas de pata por segundo
+        if self.state == "over":
+            return DINO_DEAD
+        if self.y > 0.0:
+            return DINO_JUMP
+        if self.ducking:
+            return DINO_DUCK[frame]
+        if self.state == "start":
+            return DINO_RUN[0]
+        return DINO_RUN[frame]
+
+    # ---- física ---------------------------------------------------------
+    def update(self, dt, now):
+        self.now = now
+        self.t_anim += dt
+        # MRUV na vertical: v = v0 − g·t ; y = y0 + v·t
+        g = self.gravity
+        if self.vy < 0:                       # descendo: gravidade maior
+            g *= FALL_BOOST
+        if self.fast_fall:
+            g *= FAST_FALL
+        if self.y > 0.0 or self.vy > 0.0:
+            self.vy -= g * dt
+            self.y += self.vy * dt
+            if self.y <= 0.0:
+                self.y, self.vy, self.fast_fall = 0.0, 0.0, False
+                if now < self.jump_buffer_until:
+                    self._do_jump()
+
+        # MRU na horizontal, com aceleração lenta conforme a pontuação
+        self.speed = min(MAX_SPEED, START_SPEED + self.score / 35.0)
+        dx = self.speed * dt
+        self.score += dx * 0.33
+        self.run_time += dt
+        for ob in self.obstacles:
+            ob["x"] -= dx * ob.get("rel", 1.0)
+        self.obstacles = [o for o in self.obstacles if o["x"] + len(o["sprite"][0]) > 0]
+        for cl in self.clouds:
+            cl[0] -= dx * 0.15                # paralaxe: o fundo anda mais devagar
+            if cl[0] < -len(CLOUD[0]):
+                cl[0] = self.w + random.uniform(0, 30)
+                cl[1] = random.randint(1, max(2, self.ground - 10))
+        self.mountain_x += dx * 0.3
+        self.ground_x += dx
+
+        self.since_spawn += dx
+        if self.since_spawn >= self.next_gap:
+            self.spawn()
+
+        milestone = int(self.score) // 100
+        if milestone > self.last_milestone:
+            self.last_milestone = milestone
+            self.flash_until = now + 0.9
+            self.beep()
+
+        if self.collides():
+            self.game_over(now)
+
+    def pick_kind(self):
+        s = self.score
+        kinds = ["cactus_small", "cactus_small", "gear"]
+        if s > 150:
+            kinds += ["cactus_big", "gear_big"]
+        if s > 300:
+            kinds += ["bird", "bird"]
+        return random.choice(kinds)
+
+    def spawn(self):
+        """Cria um obstáculo e sorteia a distância até o próximo.
+
+        A distância mínima garante que sempre dá para pousar e pular de novo:
+        o tempo no ar (≈0,72 s) vezes a velocidade dá o espaço que o pulo cobre.
+        O próximo obstáculo já é sorteado agora: se for um pássaro, o espaço
+        é maior, porque ele voa mais rápido e você precisa pousar e reagir.
+        """
+        s = self.score
+        kind = self.next_kind
+        self.next_kind = self.pick_kind()
+        if kind == "bird":
+            elev = random.choice([1, 3, 3, 7])   # 1: pule · 3: abaixe · 7: passe por baixo
+            self.obstacles.append({"kind": "bird", "x": float(self.w), "elev": elev,
+                                   "sprite": BIRD[0], "rel": BIRD_SPEED})
+        else:
+            sprite = OBSTACLES[kind]
+            count = 1
+            if kind == "cactus_small" and s > 200 and random.random() < 0.35:
+                count = 2
+            for i in range(count):
+                self.obstacles.append({"kind": kind, "x": float(self.w + i * (len(sprite[0]) + 0)),
+                                       "elev": 0, "sprite": sprite})
+        airtime = air_time()
+        min_gap = self.speed * airtime * 1.25 + 8
+        if self.next_kind == "bird":
+            min_gap = min_gap * BIRD_EXTRA_GAP + 6
+        self.next_gap = random.uniform(min_gap, min_gap + self.speed * 1.1)
+        self.since_spawn = 0.0
+
+    def collides(self):
+        sprite = self.dino_sprite()
+        bottom = self.ground - 1 - round(self.y)
+        top = bottom - len(sprite) + 1
+        # A cauda (3 primeiras colunas) não conta: colisão mais justa
+        cells = {(top + r, self.x + c) for r, c in mask(sprite) if c >= 3}
+        for ob in self.obstacles:
+            sp = ob["sprite"]
+            ob_bottom = self.ground - 1 - ob["elev"]
+            ob_top = ob_bottom - len(sp) + 1
+            ox = round(ob["x"])
+            if ox > self.x + 20:
+                continue
+            for r, c in mask(sp):
+                if (ob_top + r, ox + c) in cells:
+                    return True
+        return False
+
+    def game_over(self, now):
+        self.state = "over"
+        self.over_at = now
+        self.beep()
+        score = int(self.score)
+        self.stats["games"] += 1
+        self.stats["jumps"] += self.jumps
+        self.stats["seconds"] += int(self.run_time)
+        if score > self.stats["record"]:
+            self.stats["record"] = score
+            self.new_record = True
+        save_record(self.stats)
+
+    # ---- desenho --------------------------------------------------------
+    def put(self, y, x, text, attr=0):
+        """Escreve com segurança (cortando o que sai da tela)."""
+        if y < 0 or y >= self.h:
+            return
+        if x < 0:
+            text, x = text[-x:], 0
+        text = text[: max(0, self.w - x - (1 if y == self.h - 1 else 0))]
+        if text:
+            try:
+                self.scr.addstr(y, x, text, attr)
+            except curses.error:
+                pass
+
+    def draw_sprite(self, sprite, top, left, attr):
+        for r, line in enumerate(sprite):
+            for c, ch in enumerate(line):
+                if ch != " ":
+                    self.put(top + r, left + c, ch, attr)
+
+    @property
+    def night(self):
+        return (int(self.score) // 700) % 2 == 1
+
+    def draw(self, now):
+        self.scr.erase()
+        night = self.night
+        # céu
+        if night:
+            for x, y, ch in self.stars:
+                if (x + int(self.t_anim * 2)) % 9:
+                    self.put(y, x, ch, C["star"])
+            self.draw_sprite([" ▄██▄", "▐█▀  ", " ▀██▀"], 2, self.w - 16, C["moon"] | curses.A_BOLD)
+        else:
+            self.draw_sprite(["  ▄▄▄  ", " █████ ", "  ▀▀▀  "], 2, self.w - 18, C["bronze2"])
+        for cx, cy in self.clouds:
+            self.draw_sprite(CLOUD, int(cy), int(cx), C["grey"] if night else C["ivory"])
+        # montanhas ao fundo (paralaxe)
+        offset = int(self.mountain_x) % len(MOUNTAIN)
+        band = (MOUNTAIN * (self.w // len(MOUNTAIN) + 3))[offset: offset + self.w]
+        self.put(self.ground - 1, 0, band, C["dark"])
+        # chão
+        self.put(self.ground, 0, "▔" * self.w, C["bronze"])
+        gx = int(self.ground_x)
+        for px, ch in self.pebbles:
+            x = (px - gx) % 400
+            if x < self.w:
+                self.put(self.ground + 1 + (px % 2), x, ch, C["grey"])
+        # obstáculos
+        for ob in self.obstacles:
+            sp = ob["sprite"]
+            if ob["kind"] == "bird":
+                sp = ob["sprite"] = BIRD[int(self.t_anim * 6) % 2]
+                color = C["wine"]
+            elif ob["kind"].startswith("gear"):
+                color = C["bronze"]
+            else:
+                color = C["emerald"]
+            bottom = self.ground - 1 - ob["elev"]
+            self.draw_sprite(sp, bottom - len(sp) + 1, round(ob["x"]), color | curses.A_BOLD)
+        # dinossauro
+        sprite = self.dino_sprite()
+        bottom = self.ground - 1 - round(self.y)
+        color = C["wine"] if self.state == "over" else C["ivory"]
+        self.draw_sprite(sprite, bottom - len(sprite) + 1, self.x, color | curses.A_BOLD)
+        # placar
+        score = int(self.score)
+        if now < self.flash_until and int(now * 8) % 2:
+            score_txt = " " * 5
+        else:
+            score_txt = f"{score:05d}"
+        hud = f"RECORDE {self.stats['record']:05d}   {score_txt}"
+        self.put(0, self.w - len(hud) - 2, hud, C["bronze2"] | curses.A_BOLD)
+        self.put(0, 2, "SMART DINO", C["bronze"] | curses.A_BOLD)
+        self.put(self.h - 1, 2, "Espaço/↑ pular · ↓ abaixar · p pausar · m som"
+                 + (" (ligado)" if self.sound else "") + " · q sair", C["grey"])
+
+        mid = self.h // 2 - 3
+        if self.state == "start":
+            self.center(mid, "S M A R T   D I N O", C["bronze2"] | curses.A_BOLD)
+            self.center(mid + 2, "Pule os cactos e as engrenagens · abaixe dos pássaros mecânicos", C["ivory"])
+            self.center(mid + 4, "[ Espaço para começar ]", C["emerald"] | curses.A_BOLD)
+        elif self.state == "pause":
+            if self.resized:
+                self.center(mid + 1, "A janela mudou de tamanho: o jogo se ajustou", C["ivory"])
+            self.center(mid + 2, "⏸  PAUSADO  ·  p para continuar", C["bronze2"] | curses.A_BOLD)
+        elif self.state == "over":
+            self.center(mid, "F I M   D E   J O G O", C["wine"] | curses.A_BOLD)
+            self.center(mid + 2, f"Pontos: {score}    Recorde: {self.stats['record']}", C["ivory"])
+            if self.new_record:
+                self.center(mid + 3, "★ NOVO RECORDE! ★", C["bronze2"] | curses.A_BOLD)
+            self.center(mid + 5, "[ Espaço jogar de novo · q sair ]", C["emerald"] | curses.A_BOLD)
+        self.scr.noutrefresh()
+        curses.doupdate()
+
+    def center(self, y, text, attr):
+        self.put(y, max(0, (self.w - len(text)) // 2), text, attr)
+
+
+def too_small(scr):
+    scr.erase()
+    h, w = scr.getmaxyx()
+    msg = [f"Janela pequena: {w}×{h}", f"Aumente para pelo menos {MIN_W}×{MIN_H}", "(q para sair)"]
+    for i, m in enumerate(msg):
+        try:
+            scr.addstr(h // 2 - 1 + i, max(0, (w - len(m)) // 2), m[: max(0, w - 1)])
+        except curses.error:
+            pass
+    scr.refresh()
+
+
+def main(scr, stats):
+    curses.curs_set(0)
+    try:
+        curses.set_escdelay(25)               # setas respondem rápido
+    except AttributeError:
+        pass
+    scr.nodelay(True)
+    scr.keypad(True)
+    init_colors()
+    game = Game(scr, stats)
+    last = time.monotonic()
+    frame = 1.0 / FPS
+    while True:
+        now = time.monotonic()
+        dt = min(now - last, 0.05)            # evita "pulos" se o terminal travar
+        last = now
+
+        h, w = scr.getmaxyx()
+        if (h, w) != (game.h, game.w):
+            # Mudou o tamanho: ajusta sem perder a partida e pausa
+            game.resize()
+            if game.state == "run":
+                game.state = "pause"
+
+        # lê todas as teclas apertadas desde o último quadro
+        while True:
+            key = scr.getch()
+            if key == -1:
+                break
+            if key in (ord("q"), ord("Q")):    # (Esc não: as setas começam com Esc)
+                return
+            if key in (ord("m"), ord("M")):
+                game.sound = not game.sound
+            elif w < MIN_W or h < MIN_H:
+                continue
+            elif game.state == "start" and key in (ord(" "), curses.KEY_UP, ord("w"), 10):
+                game.state = "run"
+                game.jump()
+            elif game.state == "over":
+                if key in (ord(" "), curses.KEY_UP, 10) and now - game.over_at > 0.6:
+                    sound = game.sound
+                    game.reset()
+                    game.sound = sound
+                    game.state = "run"
+            elif key in (ord("p"), ord("P")):
+                game.state = "run" if game.state == "pause" else "pause"
+                game.resized = False
+            elif game.state == "run":
+                if key in (ord(" "), curses.KEY_UP, ord("w"), ord("k")):
+                    game.jump()
+                elif key in (curses.KEY_DOWN, ord("s"), ord("j")):
+                    game.duck(now)
+
+        if w < MIN_W or h < MIN_H:
+            too_small(scr)
+        else:
+            if game.state == "run":
+                game.update(dt, now)
+            elif game.state == "start":
+                game.t_anim += dt
+            game.draw(now)
+
+        # Espera o próximo quadro, mas acorda NA HORA se uma tecla chegar
+        # (em vez de dormir: assim o pulo responde sem atraso)
+        remaining = frame - (time.monotonic() - now)
+        if remaining > 0:
+            scr.timeout(max(1, int(remaining * 1000)))
+            key = scr.getch()
+            scr.nodelay(True)
+            if key != -1:
+                curses.ungetch(key)
+
+
+HELP = """smart dino — jogo de corrida no terminal
+
+  Espaço / ↑ / w   pular            ↓ / s   abaixar (no ar: cai mais rápido)
+  p                pausar           m       som liga/desliga
+  q                sair
+
+  Pule os cactos e as engrenagens; abaixe dos pássaros mecânicos (a partir de 300
+  pontos). A velocidade aumenta com a pontuação; a cada 700 pontos vira noite.
+  O recorde fica em ~/.config/adaos/dino.json.
+
+  smart dino stats   mostra o recorde e as estatísticas
+  smart dino reset   apaga o recorde"""
+
+
+def run():
+    args = sys.argv[1:]
+    if args and args[0] in ("help", "--help", "-h"):
+        print(HELP)
+        return 0
+    stats = load_record()
+    keyboard_repeat()
+    if args and args[0] == "stats":
+        mins = stats["seconds"] // 60
+        print(f"Recorde: {stats['record']} · Partidas: {stats['games']} · "
+              f"Pulos: {stats['jumps']} · Tempo jogando: {mins} min")
+        return 0
+    if args and args[0] == "reset":
+        save_record({"record": 0, "games": 0, "jumps": 0, "seconds": 0})
+        print("Recorde apagado.")
+        return 0
+    if not sys.stdout.isatty():
+        print("smart dino precisa de um terminal.")
+        return 1
+    before = stats["record"]
+    try:
+        curses.wrapper(main, stats)
+    except KeyboardInterrupt:
+        pass
+    print(f"\033[38;2;205;168;105mSMART DINO\033[0m  Recorde: {stats['record']}"
+          + ("  ★ novo!" if stats["record"] > before else "")
+          + f"  ·  Partidas: {stats['games']}")
+    print("\033[38;2;140;154;148mPara estudar o código: code ~/.local/bin/adaos-dino"
+          "  (física em update(), colisão em collides())\033[0m")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

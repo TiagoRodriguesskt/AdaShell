@@ -1,0 +1,7 @@
+# Progresso e configuração gerados em cada máquina (não versionar)
+*.json
+__pycache__/
+*.pyc
+*.swp
+*~
+.DS_Store

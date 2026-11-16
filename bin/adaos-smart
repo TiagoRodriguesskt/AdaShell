@@ -1,0 +1,2046 @@
+#!/usr/bin/env python3
+"""adaos-smart — o "cérebro" do Terminal Inteligente (estilo AdaOS).
+
+Usa uma IA que roda no seu próprio computador (Ollama), sem nuvem e sem
+conta. Só biblioteca padrão do Python: nada para instalar com pip.
+
+Subcomandos (em inglês, como no AdaOS; as mensagens são em português):
+    cmd       pedido em português  -> comando do Linux
+    explain   comando              -> explicação, parte por parte
+    fix       comando que falhou   -> causa provável + correção
+    risk      comando              -> safe / caution / danger
+    suggest   palavra digitada     -> comandos parecidos (erro de digitação)
+    status                         -> a IA está pronta?
+    model     [nome]               -> mostra ou troca o modelo
+    update    [system|tools|ai]    -> atualiza o sistema e o terminal
+    firmware  [--check|update]     -> reconhece a máquina e atualiza a BIOS
+    clean     [--check]            -> libera espaço
+    health    [--disk]             -> saúde do computador
+    net       [--local]            -> rede e internet
+    ports                          -> portas abertas
+    big       [pasta] [n]          -> o que ocupa espaço
+    learn     [next|list|n|tema]   -> aulas de terminal
+    pure                           -> modo treino (Bash de servidor)
+    dino      [stats|reset]        -> jogo de corrida (arquivo adaos-dino)
+    help      [subcomando]
+"""
+
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ----------------------------------------------------------------------------
+# Configuração
+# ----------------------------------------------------------------------------
+CONFIG_FILE = Path.home() / ".config" / "adaos" / "smart.conf"
+CACHE_DIR = Path.home() / ".cache" / "adaos"
+SUGGESTION_FILE = CACHE_DIR / "last-suggestion"
+RISK_FILE = CACHE_DIR / "last-risk"
+
+DEFAULTS = {
+    "MODEL": "qwen2.5-coder:3b",
+    "OLLAMA_URL": "http://127.0.0.1:11434",
+    "TIMEOUT": "120",
+}
+
+# Cores do AdaOS (ANSI 24 bits)
+def _rgb(hexcolor: str) -> str:
+    r, g, b = (int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
+    return f"\033[38;2;{r};{g};{b}m"
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+BRONZE = _rgb("#CDA869") if USE_COLOR else ""
+BRONZE_CLARO = _rgb("#E2C189") if USE_COLOR else ""
+VERDE = _rgb("#3FA77F") if USE_COLOR else ""
+VINHO = _rgb("#D0566B") if USE_COLOR else ""
+MARFIM = _rgb("#F4EDE1") if USE_COLOR else ""
+CINZA = _rgb("#8C9A94") if USE_COLOR else ""
+BOLD = "\033[1m" if USE_COLOR else ""
+RESET = "\033[0m" if USE_COLOR else ""
+
+
+def load_config() -> dict:
+    conf = dict(DEFAULTS)
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                conf[key.strip()] = value.strip().strip('"')
+    return conf
+
+
+def save_config(conf: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Terminal Inteligente (AdaOS) — configuração"]
+    lines += [f"{k}={v}" for k, v in conf.items()]
+    CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def info(msg: str) -> None:
+    print(f"{CINZA}{msg}{RESET}", file=sys.stderr)
+
+
+def error(msg: str) -> None:
+    print(f"{VINHO}✗ {msg}{RESET}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------
+# Análise de risco — feita aqui, NUNCA confiando só na IA
+# ----------------------------------------------------------------------------
+DANGER_PATTERNS = [
+    (r"\brm\s+(-[a-zA-Z]*[rR][a-zA-Z]*\s+)*(-[a-zA-Z]*\s+)*(/|~|\$HOME|/\*)(\s|$)", "apaga a raiz ou a pasta pessoal"),
+    (r"\bdd\b.*\bof=/dev/", "grava direto num disco"),
+    (r"\bmkfs(\.\w+)?\b", "formata uma partição"),
+    (r"\b(wipefs|shred)\b", "destrói dados de um disco/arquivo"),
+    (r"\b(fdisk|parted|gdisk|sfdisk)\b", "mexe na tabela de partições"),
+    (r">\s*/dev/(sd|nvme|hd|vd)", "escreve por cima de um disco"),
+    (r":\(\)\s*\{.*\};\s*:", "fork bomb (trava o sistema)"),
+    (r"\bchmod\s+(-R\s+)?[0-7]*777\s+/(\s|$)", "libera tudo na raiz do sistema"),
+    (r"\bchown\s+-R\s+\S+\s+/(\s|$)", "troca o dono da raiz inteira"),
+    (r"(curl|wget)[^|]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b", "baixa e executa um script da internet"),
+    (r"\b(shutdown|poweroff|reboot|halt)\b", "desliga ou reinicia o computador"),
+    (r"\bapt(-get)?\s+(purge|remove|autoremove)\b", "remove pacotes do sistema"),
+]
+CAUTION_PATTERNS = [
+    (r"\bsudo\b", "usa privilégios de administrador (sudo)"),
+    (r"\brm\b", "apaga arquivos"),
+    (r"\bmv\b", "move/renomeia (pode sobrescrever)"),
+    (r"\bchmod\b|\bchown\b", "muda permissões ou dono"),
+    (r"\bkill(all)?\b|\bpkill\b", "encerra processos"),
+    (r"\bsystemctl\s+(stop|disable|mask|restart)\b", "mexe em serviços do sistema"),
+    (r"(^|[^>])>\s*[^&\s]", "sobrescreve um arquivo com >"),
+    (r"\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|push\s+.*--force)\b", "descarta trabalho no Git"),
+]
+
+
+def analyze_risk(command: str) -> tuple:
+    reasons = [why for pat, why in DANGER_PATTERNS if re.search(pat, command)]
+    if reasons:
+        return "danger", reasons
+    reasons = [why for pat, why in CAUTION_PATTERNS if re.search(pat, command)]
+    if reasons:
+        return "caution", reasons
+    return "safe", []
+
+
+def print_risk(level: str, reasons: list) -> None:
+    if level == "danger":
+        print(f"{VINHO}{BOLD}⚠ PERIGOSO:{RESET}{VINHO} {'; '.join(reasons)}{RESET}")
+    elif level == "caution":
+        print(f"{BRONZE}⚠ Atenção:{RESET} {'; '.join(reasons)}")
+    else:
+        print(f"{VERDE}✓ Seguro:{RESET} só lê ou cria coisas, não apaga nada")
+
+
+# ----------------------------------------------------------------------------
+# Conversa com o Ollama (API HTTP local)
+# ----------------------------------------------------------------------------
+class AIUnavailable(Exception):
+    pass
+
+
+def machine_context() -> str:
+    cwd = os.getcwd()
+    try:
+        names = sorted(os.listdir(cwd))[:40]
+    except OSError:
+        names = []
+    distro = "Linux"
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                distro = line.split("=", 1)[1].strip('"')
+    except OSError:
+        pass
+    return (
+        f"Sistema: {distro}. Shell do usuário: fish (mas o comando pode usar sintaxe bash). "
+        f"Usuário: {os.environ.get('USER', '?')}. Pasta atual: {cwd}. "
+        f"Arquivos na pasta (até 40): {', '.join(names) or '(vazia)'}."
+    )
+
+
+def ask_ai(system: str, user: str, conf: dict) -> dict:
+    payload = {
+        "model": conf["MODEL"],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    req = urllib.request.Request(
+        conf["OLLAMA_URL"].rstrip("/") + "/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=float(conf["TIMEOUT"])) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise AIUnavailable(
+                f"o modelo '{conf['MODEL']}' não está baixado. Rode: ollama pull {conf['MODEL']}"
+            )
+        raise AIUnavailable(f"o Ollama respondeu com erro {exc.code}")
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+        raise AIUnavailable(
+            "a IA local (Ollama) não está rodando. Inicie com: sudo systemctl start ollama"
+            f"  ({exc})"
+        )
+    content = body.get("message", {}).get("content", "")
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        raise AIUnavailable("a IA devolveu uma resposta que não entendi; tente de novo")
+
+
+SYSTEM_CMD = """Você é o assistente de terminal do AdaOS, num Debian Linux.
+Transforme o pedido do usuário (em português) em UM comando de terminal.
+Regras:
+- Responda SÓ com JSON: {"command": "...", "explanation": "..."}
+- "command": uma única linha, pronta para rodar. Use ferramentas comuns do Debian
+  (coreutils, find, grep, apt, systemctl, ip, du, df, git, python3).
+  Não invente opções que não existem. Prefira o comando mais simples e seguro.
+  Se precisar de administrador, use sudo. Nunca apague nada sem que o usuário peça.
+- "explanation": em português do Brasil, 1 a 3 frases curtas, explicando o que
+  o comando faz e o significado das opções principais.
+- Se o pedido não for claro ou não der para fazer com um comando, devolva
+  "command": "" e use "explanation" para pedir o detalhe que falta."""
+
+SYSTEM_EXPLAIN = """Você é o professor de Linux do AdaOS. Explique o comando dado
+para um iniciante, em português do Brasil.
+Responda SÓ com JSON: {"summary": "uma frase com o que o comando faz",
+"parts": [{"part": "pedaço do comando", "meaning": "o que esse pedaço faz"}],
+"warning": "cuidado importante, ou string vazia"}
+Divida o comando nas partes que importam (programa, opções, argumentos, pipes)."""
+
+SYSTEM_FIX = """Você é o assistente de terminal do AdaOS, num Debian Linux.
+Um comando falhou. Descubra a causa provável e proponha UM comando que corrija.
+Responda SÓ com JSON: {"cause": "causa provável, em português, 1-2 frases",
+"command": "comando corrigido numa linha, ou string vazia se não houver",
+"explanation": "o que o comando corrigido faz, em português, 1-2 frases"}"""
+
+
+# ----------------------------------------------------------------------------
+# Subcomandos
+# ----------------------------------------------------------------------------
+def save_suggestion(command: str) -> str:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    level, _ = analyze_risk(command)
+    SUGGESTION_FILE.write_text(command, encoding="utf-8")
+    RISK_FILE.write_text(level, encoding="utf-8")
+    return level
+
+
+def clear_suggestion() -> None:
+    for f in (SUGGESTION_FILE, RISK_FILE):
+        if f.exists():
+            f.unlink()
+
+
+def cmd_cmd(args: list, conf: dict) -> int:
+    quiet = "--quiet" in args
+    text = " ".join(a for a in args if a not in ("--quiet", "--")).strip()
+    if not text:
+        error("diga o que você quer fazer. Exemplo: ask mostre os 5 maiores arquivos desta pasta")
+        return 2
+    clear_suggestion()
+    if not quiet:
+        info("⚙ pensando…")
+    try:
+        answer = ask_ai(SYSTEM_CMD, f"{machine_context()}\nPedido: {text}", conf)
+    except AIUnavailable as exc:
+        error(str(exc))
+        return 3
+    command = str(answer.get("command", "")).strip()
+    explanation = str(answer.get("explanation", "")).strip()
+    if not command:
+        if quiet:
+            error(explanation or "não consegui montar um comando")
+        else:
+            print(f"{BRONZE}?{RESET} {explanation or 'Não consegui montar um comando para isso.'}")
+        return 1
+    level = save_suggestion(command)
+    if quiet:  # usado pelo atalho Alt+A: só o comando, mais nada
+        print(command)
+        return 0
+    print(f"\n  {BRONZE_CLARO}{BOLD}{command}{RESET}\n")
+    if explanation:
+        print(f"  {MARFIM}{explanation}{RESET}")
+    print("  ", end="")
+    print_risk(level, analyze_risk(command)[1])
+    return 0
+
+
+def cmd_explain(args: list, conf: dict) -> int:
+    command = " ".join(a for a in args if a != "--").strip()
+    if not command:
+        error("passe um comando. Exemplo: explain tar -xzvf arquivo.tar.gz")
+        return 2
+    info("⚙ pensando…")
+    try:
+        answer = ask_ai(SYSTEM_EXPLAIN, f"Comando: {command}", conf)
+    except AIUnavailable as exc:
+        error(str(exc))
+        info("Sem a IA, mostrando o resumo offline:")
+        return explain_offline(command)
+    print(f"\n  {BRONZE_CLARO}{BOLD}{command}{RESET}\n")
+    print(f"  {MARFIM}{answer.get('summary', '')}{RESET}\n")
+    for item in answer.get("parts", []) or []:
+        if isinstance(item, dict):
+            print(f"  {BRONZE}{item.get('part', ''):<22}{RESET} {item.get('meaning', '')}")
+    warning = str(answer.get("warning", "")).strip()
+    if warning:
+        print(f"\n  {VINHO}⚠ {warning}{RESET}")
+    level, reasons = analyze_risk(command)
+    print("\n  ", end="")
+    print_risk(level, reasons)
+    return 0
+
+
+def explain_offline(command: str) -> int:
+    program = command.split()[0] if command.split() else ""
+    if program == "sudo" and len(command.split()) > 1:
+        program = command.split()[1]
+    for tool in ("tldr",):
+        if shutil.which(tool):
+            if subprocess.run([tool, program]).returncode == 0:
+                return 0
+    if shutil.which("whatis"):
+        return subprocess.run(["whatis", program]).returncode
+    error(f"sem explicação offline para '{program}'. Tente: man {program}")
+    return 1
+
+
+def cmd_fix(args: list, conf: dict) -> int:
+    status, output_file, rest = "?", None, []
+    it = iter(args)
+    for a in it:
+        if a == "--status":
+            status = next(it, "?")
+        elif a == "--output-file":
+            output_file = next(it, None)
+        elif a != "--":
+            rest.append(a)
+    command = " ".join(rest).strip()
+    if not command:
+        error("nenhum comando para corrigir")
+        return 2
+    output = ""
+    if output_file and Path(output_file).exists():
+        output = Path(output_file).read_text(encoding="utf-8", errors="replace")[-3000:]
+    clear_suggestion()
+    info("⚙ investigando o erro…")
+    prompt = (
+        f"{machine_context()}\nComando: {command}\nCódigo de saída: {status}\n"
+        f"Saída (final): {output or '(não capturada)'}"
+    )
+    try:
+        answer = ask_ai(SYSTEM_FIX, prompt, conf)
+    except AIUnavailable as exc:
+        error(str(exc))
+        return 3
+    print(f"\n  {VINHO}Causa provável:{RESET} {answer.get('cause', '?')}")
+    fixed = str(answer.get("command", "")).strip()
+    if not fixed:
+        print(f"  {CINZA}Nenhum comando de correção sugerido.{RESET}")
+        return 1
+    level = save_suggestion(fixed)
+    print(f"\n  {BRONZE_CLARO}{BOLD}{fixed}{RESET}\n")
+    if answer.get("explanation"):
+        print(f"  {MARFIM}{answer['explanation']}{RESET}")
+    print("  ", end="")
+    print_risk(level, analyze_risk(fixed)[1])
+    return 0
+
+
+def cmd_risk(args: list, conf: dict) -> int:
+    command = " ".join(a for a in args if a != "--")
+    print(analyze_risk(command)[0])
+    return 0
+
+
+def cmd_suggest(args: list, conf: dict) -> int:
+    """Erro de digitação: procura comandos parecidos no PATH (sem IA, instantâneo)."""
+    word = args[-1] if args else ""
+    if not word:
+        return 1
+    names = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            names.update(os.listdir(d))
+        except OSError:
+            continue
+    # Letras trocadas de lugar (gti -> git) vêm primeiro
+    swapped = sorted(n for n in names if n != word and sorted(n) == sorted(word))
+    close = swapped + [
+        n for n in difflib.get_close_matches(word, names, n=5, cutoff=0.6)
+        if n not in swapped
+    ]
+    close = close[:3]
+    if close:
+        print(" ".join(close))
+        return 0
+    return 1
+
+
+def cmd_status(args: list, conf: dict) -> int:
+    print(f"{BRONZE_CLARO}{BOLD}Terminal Inteligente — status{RESET}")
+    print(f"  Modelo:     {conf['MODEL']}")
+    print(f"  Ollama:     {conf['OLLAMA_URL']}")
+    print(f"  Config:     {CONFIG_FILE}")
+    try:
+        with urllib.request.urlopen(conf["OLLAMA_URL"].rstrip("/") + "/api/tags", timeout=3) as r:
+            models = [m.get("name", "") for m in json.loads(r.read()).get("models", [])]
+    except Exception:
+        print(f"  IA local:   {VINHO}desligada{RESET} (sudo systemctl start ollama)")
+        print(f"  {CINZA}Sem IA, continuam funcionando: sugestões, Ctrl+R, z, erros de digitação.{RESET}")
+        return 1
+    ok = any(m == conf["MODEL"] or m.split(":")[0] == conf["MODEL"] for m in models)
+    print(f"  IA local:   {VERDE}ligada{RESET}")
+    print(f"  Baixados:   {', '.join(models) or '(nenhum)'}")
+    if not ok:
+        print(f"  {BRONZE}O modelo configurado não está baixado: ollama pull {conf['MODEL']}{RESET}")
+        return 1
+    print(f"  {VERDE}✓ Pronto para ask, explain e fix.{RESET}")
+    return 0
+
+
+def cmd_model(args: list, conf: dict) -> int:
+    if not args:
+        print(conf["MODEL"])
+        return 0
+    conf["MODEL"] = args[0]
+    save_config(conf)
+    print(f"{VERDE}✓ Modelo trocado para {args[0]}{RESET}")
+    print(f"{CINZA}Se ainda não baixou: ollama pull {args[0]}{RESET}")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# smart update — atualiza o sistema e todas as peças do terminal
+# ----------------------------------------------------------------------------
+LOCAL_BIN = Path.home() / ".local" / "bin"
+UPDATE_PARTS = ("system", "tools", "ai")
+
+
+def version_tuple(text: str) -> tuple:
+    """'starship 1.21.1' -> (1, 21, 1). Sem número -> ()."""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    if not match:
+        return ()
+    return tuple(int(n) for n in match.groups(default="0"))
+
+
+def installed_version(program: str, *args: str) -> tuple:
+    if not shutil.which(program):
+        return ()
+    try:
+        out = subprocess.run([program, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    return version_tuple(out.stdout + out.stderr)
+
+
+def latest_github_version(repo: str) -> tuple:
+    """Pergunta ao GitHub qual é a última versão publicada (ex.: 'v1.21.1')."""
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                               "User-Agent": "adaos-smart"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return version_tuple(json.loads(resp.read()).get("tag_name", ""))
+    except Exception:
+        pass
+    # Plano B (API fora do ar ou limite de 60 consultas/hora atingido):
+    # github.com/<repo>/releases/latest redireciona para .../releases/tag/v1.21.1
+    try:
+        req = urllib.request.Request(f"https://github.com/{repo}/releases/latest",
+                                     method="HEAD", headers={"User-Agent": "adaos-smart"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return version_tuple(resp.geturl().rsplit("/", 1)[-1])
+    except Exception:
+        return ()
+
+
+def fmt_version(v: tuple) -> str:
+    return ".".join(map(str, v)) if v else "?"
+
+
+def run_step(command: list, description: str) -> bool:
+    """Mostra e roda um comando; devolve True se deu certo."""
+    print(f"  {CINZA}› {' '.join(command)}{RESET}")
+    try:
+        return subprocess.run(command).returncode == 0
+    except OSError as exc:
+        error(f"{description}: {exc}")
+        return False
+
+
+def run_remote_installer(url: str, extra_args: list) -> bool:
+    """Baixa o instalador oficial para um arquivo e roda com sh (sem curl | sh)."""
+    import tempfile
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "adaos-smart"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            script = resp.read()
+    except Exception as exc:
+        error(f"não consegui baixar {url}: {exc}")
+        return False
+    with tempfile.NamedTemporaryFile("wb", suffix=".sh", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        return run_step(["sh", path, *extra_args], url)
+    finally:
+        os.unlink(path)
+
+
+def fastfetch_from_github() -> bool:
+    """True se o fastfetch instalado NÃO veio de um repositório do apt."""
+    try:
+        out = subprocess.run(["apt-cache", "policy", "fastfetch"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Instalado de um .deb solto: a única "origem" listada é /var/lib/dpkg/status
+    origins = re.findall(r"^\s+\d+\s+(\S+)", out, flags=re.MULTILINE)
+    return bool(origins) and all(o == "/var/lib/dpkg/status" for o in origins)
+
+
+def simulate_apt(kind: str) -> dict:
+    """Simula 'upgrade' ou 'full-upgrade' sem mudar nada (apt-get -s).
+
+    Devolve {"inst": [pacotes instalados/atualizados], "remv": [removidos]}.
+    O 'apt upgrade' de verdade aceita pacotes novos, por isso --with-new-pkgs.
+    """
+    cmd = ["apt-get", "-s", "-q"]
+    cmd += ["--with-new-pkgs", "upgrade"] if kind == "upgrade" else ["full-upgrade"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                             env={**os.environ, "LC_ALL": "C"}).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {"inst": [], "remv": []}
+    inst = [l.split()[1] for l in out.splitlines() if l.startswith("Inst ")]
+    remv = [l.split()[1] for l in out.splitlines() if l.startswith("Remv ")]
+    return {"inst": inst, "remv": remv}
+
+
+def show_removals(removals: list) -> None:
+    if removals:
+        print(f"  {VINHO}{BOLD}⚠ O full-upgrade vai REMOVER {len(removals)} pacote(s):{RESET}")
+        for name in removals:
+            print(f"    {VINHO}- {name}{RESET}")
+    else:
+        print(f"  {VERDE}✓ O full-upgrade não remove nenhum pacote{RESET}")
+
+
+def cmd_update(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["update"])
+        return 0
+    check_only = "--check" in args
+    assume_yes = "--yes" in args or "-y" in args
+    full = "--full" in args
+    parts = [a for a in args if a in UPDATE_PARTS] or list(UPDATE_PARTS)
+    unknown = [a for a in args if a not in UPDATE_PARTS and a not in ("--check", "--yes", "-y", "--full")]
+    if unknown:
+        error(f"opção desconhecida: {' '.join(unknown)}")
+        print(HELP["update"])
+        return 2
+
+    results = []  # (peça, situação, deu_certo)
+
+    def title(text):
+        print(f"\n{BRONZE_CLARO}{BOLD}▸ {text}{RESET}")
+
+    def compare(name, current, latest, do_update):
+        """Compara versões e atualiza só se houver uma mais nova."""
+        if not current:
+            results.append((name, "não instalado", None))
+            print(f"  {CINZA}{name}: não instalado — pulando{RESET}")
+            return
+        if not latest:
+            results.append((name, f"{fmt_version(current)} (sem acesso ao GitHub)", None))
+            print(f"  {BRONZE}{name}: não consegui ver a versão nova (sem internet?){RESET}")
+            return
+        if current >= latest:
+            results.append((name, f"{fmt_version(current)} (já é a mais nova)", True))
+            print(f"  {VERDE}✓ {name} {fmt_version(current)} já é a mais nova{RESET}")
+            return
+        print(f"  {BRONZE}{name}: {fmt_version(current)} → {fmt_version(latest)}{RESET}")
+        if check_only:
+            results.append((name, f"{fmt_version(current)} → {fmt_version(latest)} disponível", None))
+            return
+        ok = do_update()
+        results.append((name, f"{fmt_version(current)} → {fmt_version(latest)}", ok))
+
+    print(f"{BRONZE_CLARO}{BOLD}Terminal Inteligente — atualização{RESET}"
+          + (f"  {CINZA}(só verificando, nada será instalado){RESET}" if check_only else ""))
+
+    # 1) Sistema: apt + flatpak ------------------------------------------------
+    if "system" in parts:
+        title("Sistema (apt e flatpak)")
+        if check_only:
+            run_step(["sudo", "apt-get", "update", "-qq"], "apt update")
+        else:
+            if not run_step(["sudo", "apt", "update"], "apt update"):
+                results.append(("Pacotes do apt", "falhou no apt update", False))
+
+        # Simula as duas formas (apt-get -s não muda nada e não precisa de sudo)
+        normal = simulate_apt("upgrade")
+        complete = simulate_apt("full-upgrade")
+        kept = sorted(set(complete["inst"]) - set(normal["inst"]))
+
+        if check_only:
+            pending = normal["inst"]
+            results.append(("Pacotes do apt", f"{len(pending)} para atualizar", None))
+            print(f"  {len(pending)} pacote(s) para atualizar"
+                  + (f": {', '.join(pending[:10])}{'…' if len(pending) > 10 else ''}" if pending else ""))
+            if kept:
+                print(f"  {BRONZE}{len(kept)} mantido(s), só com --full: {', '.join(kept[:10])}{RESET}")
+                results.append(("Mantidos (--full)", f"{len(kept)}: {', '.join(kept[:4])}", None))
+            if full:
+                show_removals(complete["remv"])
+        elif full:
+            print(f"  {BRONZE}Modo --full: apt full-upgrade (pode remover pacotes){RESET}")
+            removals = complete["remv"]
+            show_removals(removals)
+            go = True
+            if removals:
+                try:
+                    answer = input(f"  {VINHO}{BOLD}Digite SIM (maiúsculo) para remover esses "
+                                   f"pacotes e continuar: {RESET}")
+                except EOFError:
+                    answer = ""
+                go = answer.strip() == "SIM"
+            if not go:
+                print(f"  {CINZA}Cancelado. Rodando o upgrade normal (sem remover nada).{RESET}")
+                full = False
+            else:
+                cmd = ["sudo", "apt", "full-upgrade"]
+                if assume_yes or removals:   # já confirmou acima
+                    cmd.append("-y")
+                ok = run_step(cmd, "apt full-upgrade")
+                results.append(("Pacotes do apt", "full-upgrade feito" if ok else "falhou", ok))
+        if not check_only and not full:
+            ok = run_step(["sudo", "apt", "upgrade"] + (["-y"] if assume_yes else []), "apt upgrade")
+            results.append(("Pacotes do apt", "atualizados" if ok else "falhou", ok))
+            if ok and kept:
+                print(f"  {BRONZE}{len(kept)} pacote(s) mantido(s): {', '.join(kept[:10])}{RESET}")
+                print(f"  {CINZA}Para atualizá-los: smart update system --full{RESET}")
+                results.append(("Mantidos", f"{len(kept)} — use smart update system --full", None))
+        if shutil.which("flatpak"):
+            if check_only:
+                results.append(("Flatpak", "verifique com: flatpak remote-ls --updates", None))
+            else:
+                ok = run_step(["flatpak", "update"] + (["-y"] if assume_yes else []), "flatpak")
+                results.append(("Flatpak", "atualizados" if ok else "falhou", ok))
+
+    # 2) Ferramentas fora do apt ----------------------------------------------
+    if "tools" in parts:
+        title("Ferramentas do terminal")
+        compare("starship", installed_version("starship", "--version"),
+                latest_github_version("starship/starship"),
+                lambda: run_remote_installer("https://starship.rs/install.sh",
+                                             ["-y", "-b", str(LOCAL_BIN)]))
+
+        if shutil.which("fastfetch") and fastfetch_from_github():
+            def update_fastfetch():
+                import tempfile
+                arch = subprocess.run(["dpkg", "--print-architecture"], capture_output=True,
+                                      text=True).stdout.strip()
+                url = ("https://github.com/fastfetch-cli/fastfetch/releases/latest/download/"
+                       f"fastfetch-linux-{arch}.deb")
+                tmp = Path(tempfile.mkdtemp()) / "fastfetch.deb"
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "adaos-smart"})
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        tmp.write_bytes(resp.read())
+                except Exception as exc:
+                    error(f"download do fastfetch falhou: {exc}")
+                    return False
+                ok = run_step(["sudo", "apt-get", "install", "-y", str(tmp)], "fastfetch")
+                shutil.rmtree(tmp.parent, ignore_errors=True)
+                return ok
+            compare("fastfetch", installed_version("fastfetch", "--version"),
+                    latest_github_version("fastfetch-cli/fastfetch"), update_fastfetch)
+        elif shutil.which("fastfetch"):
+            results.append(("fastfetch", "atualiza pelo apt", True))
+
+        # tealdeer (o programa "tldr"). O do Debian 12 (1.5.0) usa um endereço
+        # antigo que foi desligado; versões >= 1.7.3 usam o novo. Por isso o
+        # tealdeer é instalado do GitHub em ~/.local/bin (vem antes no PATH).
+        if shutil.which("tldr"):
+            def install_tealdeer():
+                arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(
+                    subprocess.run(["dpkg", "--print-architecture"], capture_output=True,
+                                   text=True).stdout.strip())
+                if not arch:
+                    error("arquitetura sem binário pronto do tealdeer")
+                    return False
+                url = ("https://github.com/tealdeer-rs/tealdeer/releases/latest/download/"
+                       f"tealdeer-linux-{arch}-musl")
+                print(f"  {CINZA}› baixando {url}{RESET}")
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "adaos-smart"})
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        data = resp.read()
+                except Exception as exc:
+                    error(f"download do tealdeer falhou: {exc}")
+                    return False
+                LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+                dest = LOCAL_BIN / "tldr"
+                tmp = dest.with_suffix(".novo")
+                tmp.write_bytes(data)
+                tmp.chmod(0o755)
+                tmp.replace(dest)  # troca de uma vez só (nunca fica pela metade)
+                return True
+
+            compare("tealdeer (tldr)", installed_version("tldr", "--version"),
+                    latest_github_version("tealdeer-rs/tealdeer"), install_tealdeer)
+            tldr = str(LOCAL_BIN / "tldr") if (LOCAL_BIN / "tldr").exists() else "tldr"
+            if check_only:
+                results.append(("Exemplos do tldr", "atualizam ao rodar sem --check", None))
+            else:
+                print(f"  {CINZA}› tldr --update{RESET}")
+                out = subprocess.run([tldr, "--update"], capture_output=True, text=True)
+                ok = out.returncode == 0
+                reason = (out.stderr or out.stdout).strip().splitlines()
+                if not ok and reason:
+                    print(f"  {VINHO}{reason[-1]}{RESET}")
+                results.append(("Exemplos do tldr", "atualizados" if ok else
+                                f"falhou: {reason[-1][:60] if reason else '?'}", ok))
+
+        if shutil.which("fish") and not check_only:
+            print(f"  {CINZA}› fish_update_completions (lendo os manuais para o Tab){RESET}")
+            ok = subprocess.run(["fish", "-c", "fish_update_completions"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            results.append(("Completar com Tab", "atualizado" if ok else "falhou", ok))
+
+    # 3) IA local -------------------------------------------------------------
+    if "ai" in parts:
+        title("IA local (Ollama)")
+        compare("Ollama", installed_version("ollama", "--version"),
+                latest_github_version("ollama/ollama"),
+                lambda: run_remote_installer("https://ollama.com/install.sh", []))
+        if shutil.which("ollama"):
+            if check_only:
+                results.append((f"Modelo {conf['MODEL']}", "atualiza ao rodar sem --check", None))
+            else:
+                ok = run_step(["ollama", "pull", conf["MODEL"]], "modelo")
+                results.append((f"Modelo {conf['MODEL']}",
+                                "em dia" if ok else "falhou (o Ollama está ligado?)", ok))
+
+    # Resumo ------------------------------------------------------------------
+    print(f"\n{BRONZE_CLARO}{BOLD}Resumo{RESET}")
+    for name, situation, ok in results:
+        mark = f"{VERDE}✓" if ok else (f"{VINHO}✗" if ok is False else f"{CINZA}•")
+        print(f"  {mark} {name:<22}{RESET} {situation}")
+    print(f"  {CINZA}• Comandos ask/explain/fix: atualizam com um kit novo (bash instalar.sh){RESET}")
+    return 1 if any(ok is False for _, _, ok in results) else 0
+
+
+# ----------------------------------------------------------------------------
+# smart firmware — reconhece a máquina e atualiza a BIOS (fwupd / LVFS)
+# ----------------------------------------------------------------------------
+DMI = Path("/sys/class/dmi/id")
+POWER = Path("/sys/class/power_supply")
+MIN_BATTERY = 50
+
+
+def read_dmi(name: str) -> str:
+    try:
+        return (DMI / name).read_text().strip()
+    except OSError:
+        return ""
+
+
+def machine_info() -> dict:
+    """Lê a tabela DMI que a BIOS grava (não precisa de sudo)."""
+    vendor = read_dmi("sys_vendor")
+    name, version = read_dmi("product_name"), read_dmi("product_version")
+    # A Lenovo guarda o nome comercial em product_version ("ThinkPad T14 Gen 3")
+    # e um código em product_name ("21AH00XXBR"). Outras marcas, o contrário.
+    if vendor.upper() == "LENOVO" and version and version.lower() not in ("none", "default string"):
+        model, code = version, name
+    else:
+        model, code = name, version
+    return {
+        "vendor": vendor, "model": model, "code": code,
+        "bios_vendor": read_dmi("bios_vendor"),
+        "bios_version": read_dmi("bios_version"),
+        "bios_date": read_dmi("bios_date"),
+    }
+
+
+def power_status() -> dict:
+    """Carregador ligado? Quanto de bateria? (lê /sys/class/power_supply)."""
+    ac, battery = None, None
+    try:
+        supplies = list(POWER.iterdir())
+    except OSError:
+        supplies = []
+    for sup in supplies:
+        try:
+            kind = (sup / "type").read_text().strip()
+            if kind == "Mains":
+                ac = (ac or False) or (sup / "online").read_text().strip() == "1"
+            elif kind == "Battery" and (sup / "capacity").exists():
+                battery = int((sup / "capacity").read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return {"ac": ac, "battery": battery}
+
+
+def uefi_mode() -> bool:
+    return Path("/sys/firmware/efi").is_dir()
+
+
+def fwupd_json(*args: str) -> tuple:
+    """Roda fwupdmgr ... --json. Devolve (código de saída, dados ou None)."""
+    try:
+        out = subprocess.run(["fwupdmgr", *args, "--json"], capture_output=True,
+                             text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, None
+    try:
+        return out.returncode, json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return out.returncode, None
+
+
+def is_system_firmware(dev: dict) -> bool:
+    """A BIOS aparece no fwupd como 'System Firmware' (plugin uefi_capsule)."""
+    return (dev.get("Plugin") == "uefi_capsule"
+            or "system firmware" in str(dev.get("Name", "")).lower())
+
+
+def strip_html(text: str) -> str:
+    text = re.sub(r"<li>", "\n    • ", text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def print_machine(info: dict, power: dict) -> None:
+    print(f"{BRONZE_CLARO}{BOLD}Esta máquina{RESET}")
+    print(f"  Fabricante:   {info['vendor'] or '?'}")
+    print(f"  Modelo:       {info['model'] or '?'}"
+          + (f"  {CINZA}({info['code']}){RESET}" if info['code'] else ""))
+    print(f"  BIOS:         {info['bios_version'] or '?'}  {CINZA}de {info['bios_date'] or '?'}"
+          f" ({info['bios_vendor'] or '?'}){RESET}")
+    print(f"  Modo de boot: {'UEFI' if uefi_mode() else VINHO + 'Legacy/BIOS antigo' + RESET}")
+    if power["ac"] is None:
+        ac = f"{CINZA}não identificado{RESET}"
+    else:
+        ac = f"{VERDE}conectado{RESET}" if power["ac"] else f"{VINHO}desconectado{RESET}"
+    bat = f"{power['battery']}%" if power["battery"] is not None else "sem bateria"
+    print(f"  Energia:      carregador {ac}, bateria {bat}")
+
+
+def cmd_firmware(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["firmware"])
+        return 0
+    action = "update" if "update" in args else ("check" if "--check" in args else "info")
+    unknown = [a for a in args if a not in ("update", "--check")]
+    if unknown:
+        error(f"opção desconhecida: {' '.join(unknown)}")
+        print(HELP["firmware"])
+        return 2
+
+    info, power = machine_info(), power_status()
+    print_machine(info, power)
+
+    if not shutil.which("fwupdmgr"):
+        print(f"\n  {BRONZE}O fwupd não está instalado: sudo apt install fwupd{RESET}")
+        return 1
+
+    # Dispositivos que o fwupd conhece
+    _, devices = fwupd_json("get-devices")
+    if devices is None:
+        print(f"\n  {BRONZE}Não consegui ler a resposta do fwupd. Veja direto: fwupdmgr get-devices{RESET}")
+        return 1
+    devices = devices.get("Devices", [])
+    system = next((d for d in devices if is_system_firmware(d)), None)
+    print(f"\n{BRONZE_CLARO}{BOLD}Suporte do fabricante (LVFS){RESET}")
+    if system and "updatable" in system.get("Flags", []):
+        print(f"  {VERDE}✓ A BIOS pode ser atualizada pelo Linux{RESET}"
+              f"  {CINZA}(fwupd vê a versão {system.get('Version', '?')}){RESET}")
+    elif system:
+        print(f"  {BRONZE}A BIOS aparece no fwupd, mas sem permissão de atualizar.{RESET}")
+        print(f"  {CINZA}Pode ser a senha de supervisor ou uma opção da BIOS que bloqueia a gravação.{RESET}")
+    else:
+        print(f"  {VINHO}✗ O fwupd não encontrou a BIOS desta máquina.{RESET}")
+        print(f"  {CINZA}O fabricante pode não publicar no LVFS (veja https://fwupd.org/lvfs/devices/).{RESET}")
+    if action == "info":
+        print(f"\n  {CINZA}Para procurar BIOS nova: smart firmware --check{RESET}")
+        return 0
+
+    # Procura atualizações
+    print(f"\n{BRONZE_CLARO}{BOLD}Atualizações{RESET}")
+    print(f"  {CINZA}› fwupdmgr refresh{RESET}")
+    subprocess.run(["fwupdmgr", "refresh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _, data = fwupd_json("get-updates")
+    with_updates = [d for d in (data or {}).get("Devices", []) if d.get("Releases")]
+    bios = next((d for d in with_updates if is_system_firmware(d)), None)
+    others = [d for d in with_updates if d is not bios]
+
+    if not bios:
+        print(f"  {VERDE}✓ A BIOS já está na versão mais nova{RESET}")
+    else:
+        rel = bios["Releases"][0]
+        print(f"  {BRONZE}BIOS: {bios.get('Version', '?')} → {rel.get('Version', '?')}{RESET}"
+              + (f"  {VINHO}(urgência: {rel['Urgency']}){RESET}" if rel.get("Urgency") in ("high", "critical") else ""))
+        notes = strip_html(rel.get("Description", ""))
+        if notes:
+            print(f"  {CINZA}O que muda:{RESET} {notes[:600]}{'…' if len(notes) > 600 else ''}")
+        link = rel.get("DetailsUrl") or rel.get("Homepage")
+        if link:
+            print(f"  {CINZA}Notas completas: {link}{RESET}")
+    for dev in others:
+        print(f"  {CINZA}• Também há atualização para: {dev.get('Name', '?')} "
+              f"({dev.get('Version', '?')} → {dev['Releases'][0].get('Version', '?')}). "
+              f"Use: fwupdmgr update{RESET}")
+
+    if action == "check" or not bios:
+        if bios:
+            print(f"\n  {CINZA}Para instalar: smart firmware update{RESET}")
+        return 0
+
+    # ---- Atualização: verificações de segurança --------------------------
+    print(f"\n{BRONZE_CLARO}{BOLD}Verificações antes de gravar a BIOS{RESET}")
+    problems = []
+    if not uefi_mode():
+        problems.append("o sistema não iniciou em modo UEFI (o fwupd precisa dele)")
+    if power["ac"] is False:
+        problems.append("conecte o carregador")
+    if power["battery"] is not None and power["battery"] < MIN_BATTERY:
+        problems.append(f"bateria em {power['battery']}%: carregue até pelo menos {MIN_BATTERY}%")
+    checks = [
+        ("Modo UEFI", uefi_mode()),
+        ("Carregador conectado", power["ac"] is not False),
+        (f"Bateria ≥ {MIN_BATTERY}%", power["battery"] is None or power["battery"] >= MIN_BATTERY),
+    ]
+    for label, ok in checks:
+        print(f"  {VERDE + '✓' if ok else VINHO + '✗'} {label}{RESET}")
+    if problems:
+        print(f"\n  {VINHO}Não dá para atualizar agora: {'; '.join(problems)}.{RESET}")
+        return 1
+
+    print(f"""
+  {VINHO}{BOLD}⚠ Antes de continuar, leia:{RESET}
+  • O notebook vai {BOLD}reiniciar{RESET} e gravar a BIOS antes do sistema abrir (alguns minutos).
+  • {BOLD}Não desligue{RESET}, não feche a tampa e não tire o carregador até o sistema abrir de novo.
+  • Se a BIOS tiver senha de supervisor, a gravação pode ser recusada ou pedir a senha.
+    Normalmente, se for recusada, o notebook reinicia com a BIOS antiga.
+  • Salve e feche o que estiver aberto.""")
+    try:
+        answer = input(f"\n  {VINHO}{BOLD}Digite SIM (maiúsculo) para atualizar a BIOS: {RESET}")
+    except EOFError:
+        answer = ""
+    if answer.strip() != "SIM":
+        print(f"  {CINZA}Cancelado. Nada foi alterado.{RESET}")
+        return 1
+    device_id = bios.get("DeviceId")
+    cmd = ["fwupdmgr", "update"] + ([device_id] if device_id else [])
+    print(f"  {CINZA}› {' '.join(cmd)}{RESET}")
+    print(f"  {CINZA}(o fwupd vai pedir a senha e perguntar se pode reiniciar){RESET}")
+    return subprocess.run(cmd).returncode
+
+
+# ----------------------------------------------------------------------------
+# Ajudantes comuns dos comandos novos
+# ----------------------------------------------------------------------------
+def under(*commands: str) -> None:
+    """Mostra os comandos do Linux que fazem o mesmo trabalho (para aprender)."""
+    print(f"\n{CINZA}Por baixo (para aprender, rode você mesmo):{RESET}")
+    for c in commands:
+        print(f"  {BRONZE}{c}{RESET}")
+
+
+def human(n: float) -> str:
+    """Bytes -> texto legível: 1536 -> '1,5 KB'."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            text = f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+            return text.replace(".", ",")
+        n /= 1024
+    return str(n)
+
+
+def folder_size(path: Path) -> int:
+    """Soma o tamanho de todos os arquivos dentro de uma pasta (como o du)."""
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda e: None):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def bar(fraction: float, width: int = 20) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * width)
+    color = VERDE if fraction < 0.75 else (BRONZE if fraction < 0.9 else VINHO)
+    return f"{color}{'█' * filled}{CINZA}{'░' * (width - filled)}{RESET}"
+
+
+def ask_yes(question: str) -> bool:
+    try:
+        answer = input(f"  {BRONZE}{question} [s/N] {RESET}")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("s", "sim", "y", "yes")
+
+
+def run_capture(cmd: list, timeout: int = 30) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, "LC_ALL": "C"}).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def parse_size(text: str) -> int:
+    """'1.2G' ou '512.0M' -> bytes."""
+    m = re.search(r"([\d.]+)\s*([KMGT]?)i?B?", text or "")
+    if not m:
+        return 0
+    mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2)]
+    return int(float(m.group(1)) * mult)
+
+
+# ----------------------------------------------------------------------------
+# smart clean — libera espaço
+# ----------------------------------------------------------------------------
+def cmd_clean(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["clean"])
+        return 0
+    check_only = "--check" in args
+    home = Path.home()
+    print(f"{BRONZE_CLARO}{BOLD}Limpeza{RESET}"
+          + (f"  {CINZA}(só verificando, nada será apagado){RESET}" if check_only else ""))
+
+    # Cada item: (nome, tamanho, como limpar, precisa de sudo, explicação)
+    items = []
+    apt_cache = folder_size(Path("/var/cache/apt/archives"))
+    items.append(("Cache do apt", apt_cache, ["sudo", "apt-get", "clean"],
+                  "pacotes .deb já instalados, guardados à toa"))
+
+    sim = run_capture(["apt-get", "-s", "autoremove"])
+    orphans = [l.split()[1] for l in sim.splitlines() if l.startswith("Remv ")]
+    items.append(("Pacotes órfãos", None, ["sudo", "apt-get", "autoremove", "-y"],
+                  f"{len(orphans)} pacote(s) que nada mais usa (inclui kernels antigos)"))
+
+    jsize = parse_size(run_capture(["journalctl", "--disk-usage"]).split("take up")[-1])
+    items.append(("Logs do sistema (journal)", jsize,
+                  ["sudo", "journalctl", "--vacuum-time=2weeks"], "mantém só as 2 últimas semanas"))
+
+    thumbs = home / ".cache" / "thumbnails"
+    items.append(("Miniaturas de imagens", folder_size(thumbs), ["rm", "-rf", str(thumbs)],
+                  "recriadas sozinhas quando você abre as pastas"))
+
+    trash = home / ".local" / "share" / "Trash"
+    items.append(("Lixeira", folder_size(trash), "trash",
+                  "arquivos que você já mandou para a lixeira"))
+
+    pip_cache = home / ".cache" / "pip"
+    if pip_cache.exists():
+        items.append(("Cache do pip", folder_size(pip_cache), ["rm", "-rf", str(pip_cache)],
+                      "downloads antigos de pacotes Python"))
+    if shutil.which("uv"):
+        uv_cache = Path(run_capture(["uv", "cache", "dir"]).strip() or home / ".cache" / "uv")
+        items.append(("Cache do uv", folder_size(uv_cache), ["uv", "cache", "clean"],
+                      "downloads de pacotes Python do uv"))
+    if shutil.which("flatpak"):
+        items.append(("Flatpak sem uso", None, ["flatpak", "uninstall", "--unused", "-y"],
+                      "runtimes que nenhum app usa mais"))
+
+    total = 0
+    for i, (name, size, _cmd, why) in enumerate(items, 1):
+        size_txt = human(size) if size is not None else "—"
+        total += size or 0
+        print(f"  {BRONZE}{i}.{RESET} {name:<27} {size_txt:>9}  {CINZA}{why}{RESET}")
+    if orphans:
+        print(f"\n  {CINZA}Órfãos: {', '.join(orphans[:12])}{'…' if len(orphans) > 12 else ''}{RESET}")
+    print(f"\n  {BRONZE_CLARO}Dá para liberar pelo menos {human(total)}{RESET}")
+
+    if not check_only:
+        print(f"\n  {CINZA}Escolha o que limpar: números separados por espaço (ex.: 1 3 5),"
+              f" 'tudo' ou Enter para cancelar.{RESET}")
+        try:
+            choice = input(f"  {BRONZE}O que limpar? {RESET}").strip().lower()
+        except EOFError:
+            choice = ""
+        if choice in ("tudo", "todos", "all"):
+            chosen = list(range(1, len(items) + 1))
+        else:
+            chosen = [int(c) for c in choice.split() if c.isdigit() and 1 <= int(c) <= len(items)]
+        if not chosen:
+            print(f"  {CINZA}Cancelado. Nada foi apagado.{RESET}")
+        before = shutil.disk_usage("/").free
+        for i in chosen:
+            name, _size, cmd, _why = items[i - 1]
+            print(f"\n  {BRONZE}▸ {name}{RESET}")
+            if cmd == "trash":
+                for sub in ("files", "info", "expunged"):
+                    target = trash / sub
+                    if target.exists():
+                        print(f"  {CINZA}› rm -rf {target}/*{RESET}")
+                        for child in target.iterdir():
+                            if child.is_dir() and not child.is_symlink():
+                                shutil.rmtree(child, ignore_errors=True)
+                            else:
+                                try:
+                                    child.unlink()
+                                except OSError:
+                                    pass
+            else:
+                run_step(cmd, name)
+        if chosen:
+            freed = shutil.disk_usage("/").free - before
+            print(f"\n  {VERDE}✓ Liberado no disco do sistema: {human(max(freed, 0))}{RESET}"
+                  f"  {CINZA}(o da pasta pessoal pode ser maior, se ela estiver em outra partição){RESET}")
+
+    under("du -sh /var/cache/apt/archives        # tamanho do cache do apt",
+          "sudo apt clean                        # apaga o cache do apt",
+          "apt-get -s autoremove                 # simula: quais órfãos sairiam",
+          "sudo apt autoremove                   # remove os órfãos",
+          "journalctl --disk-usage               # espaço dos logs",
+          "sudo journalctl --vacuum-time=2weeks  # apaga logs antigos",
+          "du -sh ~/.cache/* | sort -h           # o que mais ocupa no seu cache")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# smart health — saúde do computador
+# ----------------------------------------------------------------------------
+def read_file(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def cpu_temperature():
+    """Maior temperatura entre os sensores do processador (°C)."""
+    best = None
+    for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+        name = read_file(hw / "name")
+        if name not in ("coretemp", "k10temp", "zenpower", "thinkpad", "acpitz", "cpu_thermal"):
+            continue
+        for t in hw.glob("temp*_input"):
+            try:
+                value = int(read_file(t, "0")) / 1000
+            except ValueError:
+                continue
+            if 0 < value < 130:
+                best = value if best is None else max(best, value)
+    if best is None:
+        for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+            try:
+                value = int(read_file(zone / "temp", "0")) / 1000
+            except ValueError:
+                continue
+            if 0 < value < 130:
+                best = value if best is None else max(best, value)
+    return best
+
+
+def meminfo() -> dict:
+    data = {}
+    for line in read_file("/proc/meminfo").splitlines():
+        key, _, rest = line.partition(":")
+        try:
+            data[key] = int(rest.split()[0]) * 1024
+        except (IndexError, ValueError):
+            pass
+    return data
+
+
+def battery_health():
+    for bat in Path("/sys/class/power_supply").glob("BAT*"):
+        full = read_file(bat / "energy_full") or read_file(bat / "charge_full")
+        design = read_file(bat / "energy_full_design") or read_file(bat / "charge_full_design")
+        cycles = read_file(bat / "cycle_count")
+        try:
+            pct = 100 * int(full) / int(design)
+        except (ValueError, ZeroDivisionError):
+            pct = None
+        return {"health": pct, "cycles": cycles if cycles not in ("", "0") else None,
+                "status": read_file(bat / "status"), "capacity": read_file(bat / "capacity")}
+    return None
+
+
+def disk_smart():
+    """Saúde do SSD/HD pelo smartctl (precisa de sudo)."""
+    if not shutil.which("smartctl"):
+        return None, "instale com: sudo apt install smartmontools"
+    out = run_capture(["sudo", "smartctl", "--scan", "-j"])
+    try:
+        devices = [d["name"] for d in json.loads(out).get("devices", [])]
+    except (json.JSONDecodeError, KeyError):
+        devices = []
+    results = []
+    for dev in devices:
+        raw = subprocess.run(["sudo", "smartctl", "-H", "-A", "-i", "-j", dev],
+                             capture_output=True, text=True).stdout
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        nvme = d.get("nvme_smart_health_information_log", {})
+        results.append({
+            "dev": dev,
+            "model": d.get("model_name", "?"),
+            "passed": d.get("smart_status", {}).get("passed"),
+            "used": nvme.get("percentage_used"),
+            "temp": d.get("temperature", {}).get("current"),
+            "hours": d.get("power_on_time", {}).get("hours"),
+        })
+    return results, None
+
+
+def cmd_health(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["health"])
+        return 0
+    warnings = []
+    print(f"{BRONZE_CLARO}{BOLD}Saúde do computador{RESET}")
+
+    # Disco
+    print(f"\n{BRONZE}Disco{RESET}")
+    seen = set()
+    for mount in ("/", str(Path.home())):
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            continue
+        if st.f_fsid in seen:
+            continue
+        seen.add(st.f_fsid)
+        u = shutil.disk_usage(mount)
+        frac = u.used / u.total if u.total else 0
+        print(f"  {mount:<14} {bar(frac)} {frac * 100:4.0f}%  "
+              f"{human(u.free)} livres de {human(u.total)}")
+        if frac > 0.9:
+            warnings.append(f"disco {mount} com {frac * 100:.0f}% ocupado (tente smart clean)")
+
+    # Memória
+    m = meminfo()
+    if m.get("MemTotal"):
+        used = m["MemTotal"] - m.get("MemAvailable", 0)
+        frac = used / m["MemTotal"]
+        print(f"\n{BRONZE}Memória{RESET}")
+        print(f"  {'RAM':<14} {bar(frac)} {frac * 100:4.0f}%  {human(used)} de {human(m['MemTotal'])}")
+        if m.get("SwapTotal"):
+            sw = m["SwapTotal"] - m.get("SwapFree", 0)
+            print(f"  {'Swap':<14} {bar(sw / m['SwapTotal'])} {100 * sw / m['SwapTotal']:4.0f}%"
+                  f"  {human(sw)} de {human(m['SwapTotal'])}")
+        if frac > 0.9:
+            warnings.append("memória quase cheia")
+
+    # Processador
+    print(f"\n{BRONZE}Processador{RESET}")
+    load = os.getloadavg()[0]
+    cores = os.cpu_count() or 1
+    print(f"  Carga (1 min): {load:.2f} para {cores} núcleos  {bar(load / cores)}".replace(".", ",", 1))
+    temp = cpu_temperature()
+    if temp is not None:
+        color = VERDE if temp < 70 else (BRONZE if temp < 85 else VINHO)
+        print(f"  Temperatura:   {color}{temp:.0f} °C{RESET}")
+        if temp >= 85:
+            warnings.append(f"processador quente ({temp:.0f} °C)")
+    up = float(read_file("/proc/uptime", "0").split()[0] or 0)
+    print(f"  Ligado há:     {int(up // 86400)} d {int(up % 86400 // 3600)} h {int(up % 3600 // 60)} min")
+
+    # Bateria
+    b = battery_health()
+    if b:
+        print(f"\n{BRONZE}Bateria{RESET}")
+        print(f"  Carga agora:   {b['capacity']}% ({b['status']})")
+        if b["health"] is not None:
+            color = VERDE if b["health"] >= 80 else (BRONZE if b["health"] >= 60 else VINHO)
+            print(f"  Saúde:         {color}{b['health']:.0f}%{RESET} da capacidade original")
+            if b["health"] < 60:
+                warnings.append("bateria com menos de 60% da capacidade original")
+        if b["cycles"]:
+            print(f"  Ciclos:        {b['cycles']}")
+
+    # Serviços com falha
+    failed = [l.split()[0] for l in run_capture(
+        ["systemctl", "--failed", "--no-legend", "--plain"]).splitlines() if l.strip()]
+    print(f"\n{BRONZE}Serviços do sistema{RESET}")
+    if failed:
+        print(f"  {VINHO}✗ Com falha: {', '.join(failed)}{RESET}")
+        warnings.append(f"{len(failed)} serviço(s) com falha")
+    else:
+        print(f"  {VERDE}✓ Nenhum serviço com falha{RESET}")
+
+    # SSD (opcional, com sudo)
+    if "--disk" in args:
+        print(f"\n{BRONZE}SSD / HD (SMART){RESET}")
+        disks, problem = disk_smart()
+        if problem:
+            print(f"  {BRONZE}{problem}{RESET}")
+        for d in disks or []:
+            ok = d["passed"]
+            mark = f"{VERDE}✓ saudável" if ok else (f"{VINHO}✗ COM PROBLEMA" if ok is False else f"{CINZA}? sem resposta")
+            print(f"  {d['dev']:<14} {d['model']}  {mark}{RESET}")
+            extra = []
+            if d["used"] is not None:
+                extra.append(f"desgaste {d['used']}%")
+            if d["temp"] is not None:
+                extra.append(f"{d['temp']} °C")
+            if d["hours"] is not None:
+                extra.append(f"{d['hours']} h ligado")
+            if extra:
+                print(f"  {'':<14} {CINZA}{', '.join(extra)}{RESET}")
+            if ok is False:
+                warnings.append(f"{d['dev']} com falha no SMART: faça backup!")
+    else:
+        print(f"\n  {CINZA}Saúde do SSD: smart health --disk (pede a senha){RESET}")
+
+    print(f"\n{BRONZE_CLARO}{BOLD}Resumo{RESET}")
+    if warnings:
+        for w in warnings:
+            print(f"  {VINHO}⚠ {w}{RESET}")
+    else:
+        print(f"  {VERDE}✓ Tudo em ordem{RESET}")
+
+    under("df -h                       # espaço dos discos",
+          "free -h                     # memória",
+          "uptime                      # carga e tempo ligado",
+          "sensors                     # temperaturas (pacote lm-sensors)",
+          "upower -i $(upower -e | grep BAT)   # bateria",
+          "systemctl --failed          # serviços com falha",
+          "sudo smartctl -a /dev/nvme0n1       # saúde do SSD")
+    return 1 if warnings else 0
+
+
+# ----------------------------------------------------------------------------
+# smart net — rede e internet
+# ----------------------------------------------------------------------------
+def cmd_net(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["net"])
+        return 0
+    print(f"{BRONZE_CLARO}{BOLD}Rede{RESET}")
+    print(f"  Nome da máquina:  {os.uname().nodename}")
+    if not shutil.which("ip"):
+        error("o comando ip não existe. Instale com: sudo apt install iproute2")
+
+    try:
+        addrs = json.loads(run_capture(["ip", "-j", "addr"]) or "[]")
+    except json.JSONDecodeError:
+        addrs = []
+    vpn = []
+    print(f"\n{BRONZE}Interfaces{RESET}")
+    for iface in addrs:
+        name = iface.get("ifname", "?")
+        if name == "lo":
+            continue
+        state = iface.get("operstate", "?")
+        ips = [f"{a['local']}/{a['prefixlen']}" for a in iface.get("addr_info", [])
+               if a.get("family") == "inet"]
+        kind = ("Wi-Fi" if name.startswith("wl") else "cabo" if name.startswith(("en", "eth"))
+                else "VPN" if name.startswith(("tun", "wg", "ppp", "tap", "proton", "nordlynx"))
+                else "virtual" if name.startswith(("docker", "br-", "virbr", "veth", "podman"))
+                else "")
+        if kind == "VPN" and ips:
+            vpn.append(name)
+        color = VERDE if state in ("UP", "UNKNOWN") and ips else CINZA
+        print(f"  {color}{name:<14}{RESET} {kind:<8} {', '.join(ips) or CINZA + 'sem IP' + RESET}")
+
+    try:
+        routes = json.loads(run_capture(["ip", "-j", "route", "show", "default"]) or "[]")
+    except json.JSONDecodeError:
+        routes = []
+    if routes:
+        r = routes[0]
+        print(f"\n  Roteador (gateway): {r.get('gateway', '?')} via {r.get('dev', '?')}")
+    dns = [l.split()[1] for l in read_file("/etc/resolv.conf").splitlines()
+           if l.startswith("nameserver")]
+    if dns:
+        print(f"  DNS:                {', '.join(dns)}")
+
+    if shutil.which("nmcli"):
+        for line in run_capture(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,SECURITY",
+                                 "dev", "wifi"]).splitlines():
+            parts = line.split(":")
+            if parts and parts[0] == "yes" and len(parts) >= 3:
+                print(f"  Wi-Fi:              {parts[1]}  sinal {parts[2]}%  {CINZA}{parts[3] if len(parts) > 3 else ''}{RESET}")
+
+    print(f"\n{BRONZE}Internet{RESET}")
+    import time
+    t0 = time.time()
+    try:
+        urllib.request.urlopen(urllib.request.Request("https://deb.debian.org", method="HEAD",
+                               headers={"User-Agent": "adaos-smart"}), timeout=8)
+        print(f"  {VERDE}✓ Conectado{RESET}  {CINZA}(resposta em {1000 * (time.time() - t0):.0f} ms){RESET}")
+        online = True
+    except Exception:
+        print(f"  {VINHO}✗ Sem internet{RESET}")
+        online = False
+    if online and "--local" not in args:
+        try:
+            req = urllib.request.Request("https://ipinfo.io/json", headers={"User-Agent": "adaos-smart"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                info_ip = json.loads(resp.read())
+            print(f"  IP público:  {info_ip.get('ip', '?')}  {CINZA}{info_ip.get('city', '')}, "
+                  f"{info_ip.get('region', '')}, {info_ip.get('country', '')} · {info_ip.get('org', '')}{RESET}")
+        except Exception:
+            print(f"  {CINZA}IP público: não consegui consultar{RESET}")
+    print(f"  VPN:         {VERDE + 'ativa (' + ', '.join(vpn) + ')' if vpn else CINZA + 'nenhuma'}{RESET}")
+
+    under("ip -br addr                 # interfaces e IPs (resumido)",
+          "ip route                    # rotas e roteador",
+          "nmcli dev wifi              # redes Wi-Fi e sinal",
+          "cat /etc/resolv.conf        # servidores DNS",
+          "ping -c 4 deb.debian.org    # testa a internet",
+          "curl ipinfo.io              # IP público")
+    return 0 if online else 1
+
+
+# ----------------------------------------------------------------------------
+# smart ports — quem está "ouvindo" na rede
+# ----------------------------------------------------------------------------
+KNOWN_PORTS = {
+    22: "SSH (acesso remoto)", 53: "DNS", 80: "site (HTTP)", 443: "site (HTTPS)",
+    631: "impressoras (CUPS)", 5353: "descoberta na rede local (mDNS/Avahi)",
+    3000: "app web de desenvolvimento", 5000: "app web (Flask)", 8000: "app web (Python/Django)",
+    8080: "app web / proxy", 8888: "Jupyter", 11434: "IA local (Ollama)",
+    3306: "MySQL/MariaDB", 5432: "PostgreSQL", 6379: "Redis", 27017: "MongoDB",
+    1716: "KDE Connect", 323: "relógio (chrony)", 68: "DHCP (endereço IP automático)",
+    5900: "acesso à tela (VNC)", 3389: "área de trabalho remota (RDP)",
+}
+
+
+def cmd_ports(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["ports"])
+        return 0
+    if not shutil.which("ss"):
+        error("o comando ss não existe. Instale com: sudo apt install iproute2")
+        return 1
+    out = run_capture(["ss", "-tulpnH"])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto, local = parts[0], parts[4]
+        addr, _, port = local.rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        prog = ""
+        m = re.search(r'users:\(\("([^"]+)"', line)
+        if m:
+            prog = m.group(1)
+        try:
+            port_n = int(port)
+        except ValueError:
+            continue
+        local_only = addr.startswith("127.") or addr in ("::1", "localhost")
+        rows.append((port_n, proto, addr, prog, local_only))
+    rows.sort()
+    print(f"{BRONZE_CLARO}{BOLD}Portas abertas (programas esperando conexões){RESET}\n")
+    print(f"  {CINZA}{'PORTA':<7}{'TIPO':<6}{'QUEM PODE ACESSAR':<22}{'PROGRAMA':<16}O QUE É{RESET}")
+    exposed = 0
+    for port, proto, addr, prog, local_only in rows:
+        # Primeiro alinha o texto puro, depois põe a cor (os códigos de cor
+        # ocupam caracteres invisíveis e bagunçariam o alinhamento)
+        who = f"{'só este PC' if local_only else 'a rede toda':<22}"
+        who = (VERDE if local_only else BRONZE) + who + RESET
+        if not local_only:
+            exposed += 1
+        print(f"  {port:<7}{proto:<6}{who}{prog or '?':<16}"
+              f"{CINZA}{KNOWN_PORTS.get(port, '')}{RESET}")
+    if not rows:
+        print(f"  {VERDE}Nenhuma porta aberta.{RESET}")
+    print(f"\n  {VERDE}só este PC{RESET} = só programas do seu notebook conseguem conectar (seguro).")
+    print(f"  {BRONZE}a rede toda{RESET} = outros aparelhos da mesma rede (Wi-Fi) conseguem tentar conectar.")
+    if exposed:
+        print(f"  {CINZA}{exposed} porta(s) abertas para a rede. Se não reconhecer alguma, pergunte: ask o que é a porta N{RESET}")
+    if any(not r[3] for r in rows):
+        print(f"  {CINZA}'?' = programa de outro usuário; para ver: sudo ss -tulpn{RESET}")
+
+    under("ss -tulpn                   # t=TCP u=UDP l=ouvindo p=programa n=números",
+          "sudo ss -tulpn              # mostra também programas do sistema",
+          "ss -tn                      # conexões abertas agora",
+          "sudo lsof -i :631           # quem usa a porta 631")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# smart big — o que ocupa espaço numa pasta
+# ----------------------------------------------------------------------------
+def cmd_big(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["big"])
+        return 0
+    n = 10
+    target = Path(".")
+    for a in args:
+        if a.isdigit():
+            n = int(a)
+        else:
+            target = Path(a).expanduser()
+    target = target.resolve()
+    if not target.is_dir():
+        error(f"pasta não encontrada: {target}")
+        return 2
+    print(f"{BRONZE_CLARO}{BOLD}O que mais ocupa espaço em {target}{RESET}  {CINZA}(calculando…){RESET}")
+
+    entries = []
+    try:
+        children = list(target.iterdir())
+    except PermissionError:
+        error("sem permissão para ler esta pasta")
+        return 1
+    for child in children:
+        try:
+            if child.is_symlink():
+                continue
+            size = folder_size(child) if child.is_dir() else child.stat().st_size
+        except OSError:
+            continue
+        entries.append((size, child))
+    entries.sort(reverse=True)
+    total = sum(s for s, _ in entries) or 1
+    print(f"\n{BRONZE}Pastas e arquivos aqui dentro{RESET}  {CINZA}(total {human(total)}){RESET}")
+    for size, p in entries[:n]:
+        name = p.name + ("/" if p.is_dir() else "")
+        print(f"  {human(size):>9}  {bar(size / total, 15)}  {name}")
+
+    biggest = []
+    for root, dirs, files in os.walk(target, onerror=lambda e: None):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                biggest.append((os.lstat(fp).st_size, fp))
+            except OSError:
+                pass
+    biggest.sort(reverse=True)
+    print(f"\n{BRONZE}Maiores arquivos (procurando em todas as subpastas){RESET}")
+    for size, fp in biggest[:n]:
+        print(f"  {human(size):>9}  {os.path.relpath(fp, target)}")
+
+    under(f"du -sh {target}/* | sort -h | tail -{n}        # pastas e arquivos daqui",
+          f"find {target} -type f -size +100M               # arquivos maiores que 100 MB",
+          "ncdu                                         # navegador de espaço (pacote ncdu)")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# smart learn — uma aula de terminal por vez
+# ----------------------------------------------------------------------------
+LESSONS = [
+    ("pwd", "Mostra em qual pasta você está.",
+     ["pwd"], "Abra o terminal e descubra em que pasta ele começa."),
+    ("ls", "Lista o que tem numa pasta.",
+     ["ls", "ls -l   (detalhes: tamanho, dono, data)", "ls -a   (mostra os ocultos, que começam com .)"],
+     "Liste os arquivos ocultos da sua pasta pessoal: ls -a ~"),
+    ("cd", "Entra numa pasta.",
+     ["cd Documentos", "cd ..   (volta uma pasta)", "cd ~    (vai para a pasta pessoal)", "cd -    (volta para a pasta anterior)"],
+     "Entre em Downloads, depois volte com cd - e confira com pwd."),
+    ("mkdir", "Cria pastas.",
+     ["mkdir estudos", "mkdir -p projetos/python/aula1   (-p cria as pastas do caminho todo)"],
+     "Crie ~/treino/terminal com um único comando."),
+    ("touch e echo", "touch cria um arquivo vazio; echo escreve um texto.",
+     ["touch notas.txt", "echo 'olá' > notas.txt    (> substitui o conteúdo)", "echo 'mais' >> notas.txt  (>> acrescenta no fim)"],
+     "Em ~/treino, crie lista.txt com três linhas usando echo e >>."),
+    ("cat, less, head, tail", "Mostram o conteúdo de arquivos.",
+     ["cat notas.txt", "less arquivo_grande.log   (q sai, / procura)", "head -n 5 arquivo   (5 primeiras linhas)", "tail -f arquivo.log   (acompanha o arquivo ao vivo; Ctrl+C sai)"],
+     "Veja só as 3 últimas linhas de ~/.bashrc."),
+    ("cp e mv", "cp copia; mv move ou renomeia.",
+     ["cp notas.txt copia.txt", "cp -r pasta/ copia_da_pasta/   (-r copia pastas)", "mv copia.txt antigo.txt   (renomeia)", "mv antigo.txt ~/Documentos/   (move)"],
+     "Copie lista.txt para lista_backup.txt e depois renomeie o backup para lista_velha.txt."),
+    ("rm", "Apaga arquivos. CUIDADO: não vai para a lixeira.",
+     ["rm arquivo.txt", "rm -i arquivo.txt   (pergunta antes)", "rm -r pasta/   (apaga a pasta e tudo dentro)"],
+     "Apague lista_velha.txt usando rm -i."),
+    ("grep", "Procura texto dentro de arquivos.",
+     ["grep 'erro' arquivo.log", "grep -i python notas.txt   (-i ignora maiúsculas)", "grep -rn 'import numpy' ~/Projetos   (-r subpastas, -n número da linha)"],
+     "Procure a palavra 'alias' no seu ~/.bashrc mostrando o número da linha."),
+    ("find", "Procura arquivos pelo nome, tamanho, data...",
+     ["find ~ -name '*.py'", "find . -type d -name 'venv'   (-type d = só pastas)", "find ~/Downloads -mtime -7   (modificados nos últimos 7 dias)"],
+     "Encontre todos os arquivos .pdf na sua pasta Documentos."),
+    ("| (pipe)", "Liga a saída de um comando na entrada de outro. É o superpoder do terminal.",
+     ["ls | wc -l   (conta quantos itens tem na pasta)", "history | grep apt   (procura no histórico)", "du -sh * | sort -h   (pastas ordenadas por tamanho)"],
+     "Conte quantos arquivos .py existem na sua pasta pessoal: find ~ -name '*.py' | wc -l"),
+    ("sort, uniq, wc", "Ordenam, tiram repetidos e contam.",
+     ["sort nomes.txt", "sort nomes.txt | uniq -c   (conta repetidos)", "wc -l arquivo   (número de linhas)"],
+     "Descubra os 5 comandos que você mais usa. No fish: history | awk '{print $1}' | sort | uniq -c | sort -rn | head -5 · no bash o history numera as linhas, então troque $1 por $2"),
+    ("chmod", "Muda permissões. O mais comum: deixar um script executável.",
+     ["chmod +x script.sh", "./script.sh   (roda o script da pasta atual)", "ls -l   (rwx = ler, escrever, executar)"],
+     "Crie um script ola.sh com duas linhas: #!/bin/bash (diz qual programa roda o script) e echo 'olá'. Depois: chmod +x ola.sh e ./ola.sh"),
+    ("sudo e apt", "sudo roda como administrador; apt instala programas.",
+     ["sudo apt update   (atualiza a lista)", "apt search cowsay", "sudo apt install cowsay", "sudo apt remove cowsay"],
+     "Instale o pacote sl, rode sl e remova depois."),
+    ("ps, top, kill", "Veem e encerram programas em execução.",
+     ["ps aux | grep firefox", "btop   (monitor bonito; q sai)", "kill 12345   (encerra o processo 12345)", "pkill firefox   (encerra pelo nome)"],
+     "Abra o btop, descubra qual programa usa mais memória e saia com q."),
+    ("df e du", "df mostra o espaço dos discos; du o tamanho de pastas.",
+     ["df -h", "du -sh ~/Downloads", "du -sh ~/* | sort -h"],
+     "Descubra qual pasta da sua pasta pessoal é a maior. (Depois compare com: smart big ~)"),
+    ("tar", "Compacta e descompacta.",
+     ["tar -czvf backup.tar.gz pasta/   (c=criar z=gzip v=mostrar f=arquivo)", "tar -xzvf backup.tar.gz   (x=extrair)", "tar -tzf backup.tar.gz   (t=lista sem extrair)"],
+     "Compacte ~/treino em treino.tar.gz e liste o conteúdo sem extrair."),
+    ("Variáveis e $PATH", "Variáveis guardam valores; o PATH diz onde o terminal procura programas.",
+     ["echo $HOME", "echo $PATH", "set -x NOME Tiago   (cria variável no fish)", "export NOME=Tiago   (cria variável no bash)", "which python3   (onde está o programa)"],
+     "Descubra onde estão instalados o python3, o fish e o adaos-smart com which."),
+    ("Atalhos de edição", "Editar a linha sem usar o mouse.",
+     ["Ctrl+A início da linha · Ctrl+E fim", "Ctrl+W apaga a palavra anterior · Ctrl+U apaga até o início", "Ctrl+L limpa a tela", "Tab completa · ↑ comando anterior"],
+     "Escreva um comando longo e pratique Ctrl+A, Ctrl+E e Ctrl+W."),
+    ("systemctl e journalctl", "Controlam serviços (programas que rodam em segundo plano) e seus registros.",
+     ["systemctl status ollama", "sudo systemctl restart ollama", "journalctl -u ollama -n 20   (últimas 20 linhas do log)", "systemctl --failed"],
+     "Veja o status do serviço NetworkManager e as últimas 10 linhas do log dele."),
+    ("ip e ping", "Mostram a rede e testam conexões.",
+     ["ip -br addr", "ping -c 4 deb.debian.org", "ss -tulpn   (portas abertas; veja também smart ports)"],
+     "Descubra seu IP local e teste a conexão com o site do Debian."),
+    ("curl", "Baixa coisas da internet pelo terminal.",
+     ["curl ipinfo.io", "curl -O https://exemplo.com/arquivo.zip   (-O salva com o mesmo nome)", "curl -s wttr.in/Belo_Horizonte   (previsão do tempo!)"],
+     "Veja a previsão do tempo da sua cidade com curl wttr.in."),
+    ("ssh", "Acessa outro computador pelo terminal.",
+     ["ssh usuario@servidor", "ssh -p 2222 usuario@servidor   (outra porta)", "ssh-keygen -t ed25519   (cria sua chave)", "ssh-copy-id usuario@servidor   (entra sem senha)"],
+     "Crie uma chave SSH com ssh-keygen -t ed25519 (se ainda não tiver) e veja a pública em ~/.ssh/id_ed25519.pub."),
+    ("git (básico)", "Controle de versões dos seus projetos.",
+     ["git status", "git add arquivo.py", "git commit -m 'mensagem'", "git log --oneline", "git push"],
+     "Num repositório seu, rode git log --oneline -5 e explain em algum comando que não conheça."),
+    ("Redirecionar erros", "Separar a saída normal das mensagens de erro.",
+     ["comando > saida.txt   (só a saída normal)", "comando 2> erros.txt   (só os erros)", "comando > tudo.txt 2>&1   (os dois juntos)", "comando 2>/dev/null   (joga os erros fora)"],
+     "Rode find / -name '*.conf' 2>/dev/null | head e veja a diferença sem o 2>/dev/null."),
+    ("xargs", "Transforma uma lista em argumentos de outro comando.",
+     ["find . -name '*.tmp' | xargs rm", "find . -name '*.tmp' -print0 | xargs -0 rm   (seguro com nomes que têm espaço)", "cat pacotes.txt | xargs sudo apt install -y", "find . -name '*.png' | xargs -I{} cp {} backup/   ({} = cada nome)"],
+     "Crie 3 arquivos .tmp em ~/treino e apague todos com find + xargs."),
+    ("man, tldr, explain", "Onde buscar ajuda.",
+     ["man ls   (manual completo; q sai, / procura)", "tldr ls   (exemplos práticos)", "explain ls -lah   (o seu terminal explica)", "ls --help"],
+     "Compare man tar, tldr tar e explain tar -xzvf a.tar.gz. Qual ajudou mais?"),
+]
+
+LEARN_FILE = Path.home() / ".config" / "adaos" / "learn.json"
+
+
+def load_learn() -> dict:
+    """Lê o progresso. Se o arquivo faltar, estiver corrompido ou incompleto,
+    corrige em vez de quebrar."""
+    state = {"next": 0, "done": []}
+    try:
+        data = json.loads(LEARN_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return state
+    if isinstance(data, dict):
+        nxt = data.get("next", 0)
+        if isinstance(nxt, int) and 0 <= nxt < len(LESSONS):
+            state["next"] = nxt
+        done = data.get("done", [])
+        if isinstance(done, list):
+            state["done"] = sorted({d for d in done if isinstance(d, int) and 0 <= d < len(LESSONS)})
+    return state
+
+
+# Palavras do dia a dia que levam a uma aula (palavra -> parte do título)
+LESSON_KEYWORDS = {
+    "atalho": "Atalhos", "atalhos": "Atalhos", "ctrl": "Atalhos", "teclado": "Atalhos",
+    "log": "systemctl", "logs": "systemctl", "serviço": "systemctl", "servico": "systemctl",
+    "permissão": "chmod", "permissao": "chmod", "script": "chmod", "executar": "chmod",
+    "variável": "Variáveis", "variavel": "Variáveis", "export": "Variáveis", "which": "Variáveis",
+    "compactar": "tar", "descompactar": "tar", "zip": "tar", "backup": "tar",
+    "procurar": "grep", "buscar": "grep", "arquivo": "find",
+    "copiar": "cp e mv", "mover": "cp e mv", "renomear": "cp e mv", "mv": "cp e mv", "cp": "cp e mv",
+    "apagar": "rm", "deletar": "rm", "pasta": "mkdir", "criar": "mkdir",
+    "processo": "ps, top", "processos": "ps, top", "top": "ps, top", "btop": "ps, top",
+    "espaço": "df e du", "espaco": "df e du", "disco": "df e du", "df": "df e du",
+    "rede": "ip e ping", "internet": "ip e ping", "ss": "ip e ping",
+    "instalar": "sudo e apt", "pacote": "sudo e apt", "pacotes": "sudo e apt",
+    "erro": "Redirecionar", "erros": "Redirecionar", "redirecionar": "Redirecionar", "/dev/null": "Redirecionar",
+    "ajuda": "man, tldr", "tldr": "man, tldr", "help": "man, tldr", "manual": "man, tldr",
+    "historico": "| (pipe)", "histórico": "| (pipe)", "history": "| (pipe)",
+    "less": "cat, less", "head": "cat, less", "touch": "touch e echo", "wc": "sort, uniq",
+    "sort": "sort, uniq", "chave": "ssh", "servidor": "ssh", "commit": "git", "baixar": "curl",
+    "download": "curl", "pwd": "pwd", "onde": "pwd",
+}
+
+
+def find_lesson(term: str):
+    """Procura a aula pelo assunto: primeiro a palavra exata, depois parte da palavra.
+    (Assim 'ip' acha 'ip e ping', e não 'pipe'.)"""
+    term = term.lower()
+    words = [set(re.findall(r"[\w$]+", title.lower())) for title, *_ in LESSONS]
+    for i, w in enumerate(words):
+        if term in w or "$" + term in w:
+            return i
+    if term in LESSON_KEYWORDS:
+        target = LESSON_KEYWORDS[term].lower()
+        for i, (title, *_rest) in enumerate(LESSONS):
+            if target in title.lower():
+                return i
+    for i, (title, *_rest) in enumerate(LESSONS):
+        if term in title.lower():
+            return i
+    return None
+
+
+def show_lesson(i: int) -> None:
+    title, what, examples, exercise = LESSONS[i]
+    print(f"{BRONZE_CLARO}{BOLD}Aula {i + 1} de {len(LESSONS)}: {title}{RESET}\n")
+    print(f"  {MARFIM}{what}{RESET}\n")
+    for ex in examples:
+        cmd, _, note = ex.partition("   (")
+        # Atalhos de teclado não são comandos: mostra ⌨ em vez do $
+        prompt = "⌨" if cmd.startswith(("Ctrl", "Tab", "Alt")) else "$"
+        print(f"  {BRONZE}{prompt}{RESET} {BOLD}{cmd}{RESET}" + (f"   {CINZA}({note}{RESET}" if note else ""))
+    print(f"\n  {VERDE}✎ Exercício:{RESET} {exercise}")
+    print(f"\n  {CINZA}Próxima aula: smart learn next · Todas: smart learn list · "
+          f"Dúvida: explain <comando>{RESET}")
+
+
+def cmd_learn(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["learn"])
+        return 0
+    # "smart learn explain git": explain é um comando sozinho (fora do smart learn)
+    if args and args[0] in ("explain", "ask", "fix"):
+        rest = " ".join(args[1:])
+        print(f"{CINZA}(dica: {args[0]} é um comando sozinho: digite só {args[0]} {rest}){RESET}")
+        if args[0] == "explain":
+            return cmd_explain(args[1:], conf)
+        return 2
+    state = load_learn()
+    if args and args[0] == "list":
+        print(f"{BRONZE_CLARO}{BOLD}Aulas de terminal{RESET}\n")
+        for i, (title, what, _e, _x) in enumerate(LESSONS):
+            mark = f"{VERDE}✓" if i in state["done"] else f"{CINZA}·"
+            print(f"  {mark} {i + 1:>2}. {title:<24}{RESET} {CINZA}{what}{RESET}")
+        print(f"\n  {CINZA}{len(state['done'])} de {len(LESSONS)} vistas · smart learn <número> abre uma aula{RESET}")
+        return 0
+    if args and args[0] == "reset":
+        state = {"next": 0, "done": []}
+    elif args and args[0].isdigit():
+        i = int(args[0]) - 1
+        if not 0 <= i < len(LESSONS):
+            error(f"escolha uma aula de 1 a {len(LESSONS)}")
+            return 2
+        state["next"] = i
+    elif args and args[0] == "next":
+        if state["next"] == len(LESSONS) - 1:
+            vistas = len(set(state["done"]) | {state["next"]})
+            print(f"{VERDE}{BOLD}★ Você chegou ao fim das {len(LESSONS)} aulas!{RESET} "
+                  f"{CINZA}({vistas} de {len(LESSONS)} vistas){RESET}")
+            print(f"{CINZA}Para treinar como num servidor: smart pure · "
+                  f"Recomeçando pela aula 1:{RESET}\n")
+        state["next"] = (state["next"] + 1) % len(LESSONS)
+    elif args:
+        # smart learn grep -> procura a aula pelo assunto
+        found = find_lesson(" ".join(args))
+        if found is None:
+            error(f"não achei aula sobre '{' '.join(args)}'. Veja: smart learn list · "
+                  f"para explicar um comando: explain {args[0]} · exemplos: tldr {args[0]}")
+            return 2
+        state["next"] = found
+    i = state["next"]
+    if i not in state["done"]:
+        state["done"].append(i)
+    try:
+        LEARN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LEARN_FILE.write_text(json.dumps(state))
+    except OSError:
+        error("não consegui salvar o progresso (a aula aparece normalmente)")
+    show_lesson(i)
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# smart pure — modo treino: um Bash "de servidor", sem ajudas
+# ----------------------------------------------------------------------------
+PURE_RC = r'''
+# Modo treino do Terminal Inteligente: Bash puro, como num servidor
+PS1='\[\e[1;33m\][treino]\[\e[0m\] \u@\h:\w\$ '
+HISTFILE="$HOME/.config/adaos/pure_history"
+HISTSIZE=5000
+HISTFILESIZE=5000
+unset HISTCONTROL
+unset command_not_found_handle
+__pure_n=""
+__pure_log() {
+    local st=$? line n
+    line=$(HISTTIMEFORMAT= history 1)
+    n=$(printf '%s' "$line" | awk '{print $1}')
+    if [ -z "$__pure_n" ]; then __pure_n="${n:-0}"; return; fi
+    if [ -n "$n" ] && [ "$n" != "$__pure_n" ]; then
+        __pure_n=$n
+        printf '%s\t%s\n' "$st" "$(printf '%s' "$line" | sed 's/^ *[0-9]* *//')" >> "$PURE_LOG"
+    fi
+} 2>/dev/null
+PROMPT_COMMAND=__pure_log
+'''
+
+
+def cmd_pure(args: list, conf: dict) -> int:
+    if any(a in ("help", "--help", "-h") for a in args):
+        print(HELP["pure"])
+        return 0
+    import tempfile
+    import time
+    local_bin = str(Path.home() / ".local" / "bin")
+    path = ":".join(p for p in os.environ.get("PATH", "").split(":")
+                    if p and os.path.realpath(p) != os.path.realpath(local_bin))
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("STARSHIP", "BAT_", "_ZO", "fish_", "__fish"))}
+    env["PATH"] = path
+    env["SHELL"] = shutil.which("bash") or "/bin/bash"
+
+    (Path.home() / ".config" / "adaos").mkdir(parents=True, exist_ok=True)
+    rc = tempfile.NamedTemporaryFile("w", suffix=".bashrc", delete=False)
+    rc.write(PURE_RC)
+    rc.close()
+    log = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+    log.close()
+    env["PURE_LOG"] = log.name
+
+    print(f"""{BRONZE_CLARO}{BOLD}Modo treino{RESET}  {CINZA}(Bash puro, como num servidor){RESET}
+
+  Aqui {BOLD}não{RESET} tem: ask, explain, fix, smart, z, sugestão cinza, fzf, cores do exa/bat.
+  Tem só o que todo Linux tem. Erros aparecem como num servidor:
+  {CINZA}bash: comando: command not found{RESET}
+
+  Ajuda que existe em qualquer servidor: {BRONZE}man <comando>{RESET} e {BRONZE}<comando> --help{RESET}
+  Para sair e ver o resumo do treino: {BRONZE}exit{RESET} (ou Ctrl+D)""")
+    state = load_learn()
+    i = state.get("next", 0)
+    if 0 <= i < len(LESSONS):
+        print(f"\n  {VERDE}✎ Sugestão (aula {i + 1}, {LESSONS[i][0]}):{RESET} {LESSONS[i][3]}")
+    print()
+
+    start = time.time()
+    try:
+        subprocess.run([env["SHELL"], "--noprofile", "--rcfile", rc.name, "-i"], env=env)
+    finally:
+        os.unlink(rc.name)
+
+    entries = []
+    for line in Path(log.name).read_text(errors="replace").splitlines():
+        st, _, cmd = line.partition("\t")
+        if cmd.strip() and cmd.strip() != "exit":
+            entries.append((st, cmd.strip()))
+    os.unlink(log.name)
+
+    minutes = (time.time() - start) / 60
+    failed = [(st, c) for st, c in entries if st not in ("0", "")]
+    print(f"\n{BRONZE_CLARO}{BOLD}Resumo do treino{RESET}  {CINZA}({minutes:.0f} min){RESET}".replace(".", ","))
+    if not entries:
+        print(f"  {CINZA}Nenhum comando digitado.{RESET}")
+        return 0
+    ok = len(entries) - len(failed)
+    print(f"  Comandos digitados: {len(entries)}   {VERDE}✓ {ok} certos{RESET}   "
+          f"{(VINHO + '✗ ' + str(len(failed)) + ' com erro') if failed else CINZA + '✗ 0 com erro'}{RESET}")
+    progs = {}
+    for _st, c in entries:
+        word = c.split()[0]
+        if word == "sudo" and len(c.split()) > 1:
+            word = c.split()[1]
+        progs[word] = progs.get(word, 0) + 1
+    top = sorted(progs.items(), key=lambda kv: -kv[1])[:8]
+    print(f"  Mais usados: {', '.join(f'{p} ({n})' for p, n in top)}")
+    # Hábitos do terminal inteligente / do Fish que não funcionam num servidor
+    tips = []
+    for st, c in entries:
+        word = c.split()[0]
+        if re.match(r"set\s+-[gUl]*x\b", c):
+            tips.append(f"'{c}': no Bash, crie variáveis com {BOLD}export NOME=valor{RESET}. "
+                        f"Lá, set -x liga o modo de depuração (linhas com +); desliga com set +x")
+        elif word in ("ask", "explain", "fix", "smart", "z", "zi") and st == "127":
+            tips.append(f"'{word}' é do seu terminal inteligente; num servidor não existe. "
+                        f"Use man {c.split()[1] if len(c.split()) > 1 and word == 'explain' else '<comando>'} "
+                        f"ou <comando> --help")
+        elif word in ("ll", "la") and st == "127":
+            tips.append(f"'{word}' é um apelido; o comando padrão é ls -l (ou ls -la)")
+        elif re.search(r"(^|[^$])\((?!\))[a-z]", c) and "$(" not in c and not c.startswith(("for", "while", "if")):
+            tips.append(f"'{c}': no Bash, o resultado de um comando é {BOLD}$(comando){RESET}, não (comando)")
+        elif re.match(r"(if|for|while)\b.*\bend\s*$", c):
+            tips.append(f"'{c}': no Bash, if termina com fi e for/while com done (end é do Fish)")
+    if tips:
+        print(f"\n  {BRONZE}Hábitos do Fish/terminal inteligente que apareceram:{RESET}")
+        for t in dict.fromkeys(tips):
+            print(f"    • {t}")
+    if failed:
+        print(f"\n  {VINHO}Comandos com erro{RESET} {CINZA}(código de saída entre colchetes){RESET}")
+        for st, c in failed[-10:]:
+            print(f"    [{st}] {c}")
+        print(f"\n  {CINZA}Para entender um erro: explain <comando>  ·  "
+              f"127 = comando não existe · 1/2 = opção ou arquivo errado · 126 = sem permissão{RESET}")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# smart dino — o jogo (arquivo separado: adaos-dino)
+# ----------------------------------------------------------------------------
+def cmd_dino(args: list, conf: dict) -> int:
+    here = Path(__file__).resolve().parent / "adaos-dino"
+    game = here if here.exists() else Path.home() / ".local" / "bin" / "adaos-dino"
+    if not game.exists():
+        error("o jogo não está instalado. Rode de novo: bash instalar.sh")
+        return 1
+    os.execv(sys.executable, [sys.executable, str(game), *args])
+
+
+HELP = {
+    "main": f"""{BRONZE_CLARO}{BOLD}Terminal Inteligente (AdaOS){RESET}
+
+  {BRONZE}ask{RESET} <pedido>        Pedido em português -> comando (pergunta antes de rodar)
+  {BRONZE}explain{RESET} [comando]   Explica um comando parte por parte (sem nada: o último)
+  {BRONZE}fix{RESET}                 Analisa o último comando que deu erro e sugere a correção
+  {BRONZE}smart status{RESET}        A IA local está pronta?
+  {BRONZE}smart model{RESET} [nome]  Mostra ou troca o modelo (ex.: qwen2.5-coder:7b)
+  {BRONZE}smart update{RESET}        Atualiza o sistema, as ferramentas e a IA (smart update help)
+  {BRONZE}smart firmware{RESET}      Mostra a máquina e atualiza a BIOS (smart firmware help)
+  {BRONZE}smart clean{RESET}         Libera espaço (cache, órfãos, logs, lixeira)
+  {BRONZE}smart health{RESET}        Saúde: disco, memória, temperatura, bateria, SSD
+  {BRONZE}smart net{RESET}           Rede: IPs, Wi-Fi, roteador, DNS, internet, VPN
+  {BRONZE}smart ports{RESET}         Portas abertas e quem pode acessá-las
+  {BRONZE}smart big{RESET} [pasta]   O que mais ocupa espaço numa pasta
+  {BRONZE}smart learn{RESET}         Aulas de terminal, uma por vez
+  {BRONZE}smart pure{RESET}          Modo treino: Bash puro, como num servidor (exit volta)
+  {BRONZE}smart dino{RESET}          Jogo de corrida no terminal (smart dino help)
+  {BRONZE}smart tips{RESET}          Atalhos e truques do terminal
+
+{BRONZE_CLARO}Atalhos de teclado{RESET}
+  {BRONZE}Alt+A{RESET}     Escreva em português na linha e aperte: vira comando (você revisa e dá Enter)
+  {BRONZE}Alt+E{RESET}     Explica o comando que está na linha
+  {BRONZE}→ ou Ctrl+F{RESET} Aceita a sugestão cinza (vinda do seu histórico)
+  {BRONZE}Ctrl+R{RESET}    Busca no histórico (fzf)      {BRONZE}Ctrl+T{RESET}  Busca arquivos
+  {BRONZE}Alt+C{RESET}     Entra numa pasta (fzf)       {BRONZE}z{RESET} <nome> Pula para pasta já visitada
+
+A IA roda no seu computador (Ollama). Nada vai para a internet.""",
+    "ask": f"""{BRONZE}ask{RESET} <pedido em português>
+  Exemplo: ask quais pastas ocupam mais espaço aqui
+  Mostra o comando, a explicação e o nível de risco; só roda se você confirmar.
+  Comandos perigosos pedem que você digite SIM.""",
+    "explain": f"""{BRONZE}explain{RESET} [comando]
+  Exemplo: explain find . -name '*.py' -mtime -7
+  Sem comando, explica o último que você rodou. Sem a IA, usa o tldr.""",
+    "fix": f"""{BRONZE}fix{RESET}
+  Depois de um comando dar erro, digite fix. Ele pode rodar o comando de novo
+  (só se for seguro) para ler a mensagem de erro, e sugere a correção.""",
+    "clean": f"""{BRONZE}smart clean{RESET} [--check]
+  Mostra o que dá para apagar e quanto espaço libera, e você escolhe:
+    cache do apt, pacotes órfãos (autoremove), logs com mais de 2 semanas,
+    miniaturas, lixeira, caches do pip e do uv, Flatpak sem uso.
+    {BRONZE}--check{RESET}  só mostra, não apaga nada
+  Na pergunta, digite os números (ex.: 1 3 5), 'tudo' ou Enter para cancelar.""",
+    "health": f"""{BRONZE}smart health{RESET} [--disk]
+  Disco, memória, carga e temperatura do processador, tempo ligado,
+  saúde da bateria e serviços com falha. Mostra ⚠ no que precisa de atenção.
+    {BRONZE}--disk{RESET}   inclui a saúde do SSD/HD (SMART); pede a senha""",
+    "net": f"""{BRONZE}smart net{RESET} [--local]
+  Interfaces e IPs, roteador, DNS, Wi-Fi (rede e sinal), teste de internet,
+  IP público com cidade/país (consulta ipinfo.io) e se há VPN ativa.
+    {BRONZE}--local{RESET}  não consulta o IP público (nada sai para a internet além do teste)""",
+    "ports": f"""{BRONZE}smart ports{RESET}
+  Lista os programas esperando conexões (portas abertas), diz o que é cada
+  porta conhecida e se só o seu PC ou a rede toda pode acessar.""",
+    "big": f"""{BRONZE}smart big{RESET} [pasta] [quantidade]
+  O que mais ocupa espaço: pastas/arquivos da pasta e os maiores arquivos
+  de todas as subpastas. Exemplos: smart big · smart big ~ · smart big ~/Downloads 20""",
+    "pure": f"""{BRONZE}smart pure{RESET}
+  Modo treino: abre um Bash puro, como o de um servidor da empresa.
+  Sem ask/explain/fix/smart, sem z, sem sugestão cinza, sem fzf, sem apelidos.
+  Prompt: [treino] usuario@maquina:pasta$  ·  Histórico próprio do treino.
+  Ao sair (exit ou Ctrl+D), mostra o resumo: comandos digitados, certos,
+  com erro (e o código de cada erro) e os mais usados.""",
+    "learn": f"""{BRONZE}smart learn{RESET} [next | list | <número> | <assunto> | reset]
+  Aulas curtas de terminal, com exemplos e um exercício.
+    smart learn          a aula atual
+    smart learn next     a próxima aula
+    smart learn list     todas as aulas (✓ = já vista)
+    smart learn 11       vai para a aula 11
+    smart learn grep     procura a aula sobre grep
+    smart learn reset    recomeça do zero""",
+    "firmware": f"""{BRONZE}smart firmware{RESET} [--check | update]
+  Reconhece a máquina pela tabela DMI e atualiza a BIOS pelo fwupd (LVFS).
+    {BRONZE}smart firmware{RESET}           mostra fabricante, modelo, BIOS, modo de boot, energia
+                             e se o fabricante dá suporte no LVFS
+    {BRONZE}smart firmware --check{RESET}   procura BIOS nova (mostra versão e o que muda)
+    {BRONZE}smart firmware update{RESET}    grava a BIOS nova
+  Proteções do update: exige modo UEFI, carregador conectado e bateria >= 50%;
+  mostra os avisos e só continua se você digitar SIM. O notebook reinicia para gravar.""",
+    "update": f"""{BRONZE}smart update{RESET} [partes] [opções]
+  Atualiza tudo, em 3 partes:
+    {BRONZE}system{RESET}   pacotes do apt (sudo apt update + upgrade) e Flatpak
+    {BRONZE}tools{RESET}    starship, fastfetch (se veio do GitHub), exemplos do tldr, Tab do fish
+    {BRONZE}ai{RESET}       Ollama e o modelo configurado
+  Opções:
+    {BRONZE}--check{RESET}  só mostra o que tem de novo, sem instalar nada
+    {BRONZE}--yes{RESET}    não pergunta [S/n] no apt e no Flatpak
+  Exemplos:
+    smart update               tudo
+    smart update --check       o que tem de novo?
+    smart update tools ai      só as ferramentas e a IA
+    smart update --full        tudo, com full-upgrade
+    smart update --check --full  mostra o que o full-upgrade removeria
+  Ferramentas de fora do apt só são reinstaladas se houver versão nova no GitHub.""",
+}
+
+TIPS = f"""{BRONZE_CLARO}{BOLD}Truques do Terminal Inteligente{RESET}
+  • Comece a digitar: o fish sugere em cinza o que você já usou. → aceita tudo, Alt+→ uma palavra.
+  • Tab completa comandos, opções e até ramos do Git. Tab duas vezes mostra o menu.
+  • Comando em vermelho = não existe. Em verde/branco = existe.
+  • z proj  -> pula para ~/Projetos (aprende as pastas que você mais usa).
+  • ll, la, tree   -> listagens com cores e ícones de Git.
+  • cat arquivo.py -> com cores (bat). tldr <comando> -> exemplos práticos.
+  • Comandos longos (> 30 s) avisam com uma notificação quando terminam."""
+
+
+def cmd_help(args: list, conf: dict) -> int:
+    print(HELP.get(args[0] if args else "main", HELP["main"]))
+    return 0
+
+
+def cmd_tips(args: list, conf: dict) -> int:
+    print(TIPS)
+    return 0
+
+
+COMMANDS = {
+    "cmd": cmd_cmd, "explain": cmd_explain, "fix": cmd_fix, "risk": cmd_risk,
+    "suggest": cmd_suggest, "status": cmd_status, "model": cmd_model,
+    "help": cmd_help, "--help": cmd_help, "-h": cmd_help, "tips": cmd_tips,
+    "update": cmd_update, "firmware": cmd_firmware, "clean": cmd_clean,
+    "health": cmd_health, "net": cmd_net, "ports": cmd_ports, "big": cmd_big,
+    "learn": cmd_learn, "pure": cmd_pure, "dino": cmd_dino,
+}
+
+
+def main() -> int:
+    conf = load_config()
+    if len(sys.argv) < 2:
+        return cmd_help([], conf)
+    name, args = sys.argv[1], sys.argv[2:]
+    func = COMMANDS.get(name)
+    if func is None:
+        error(f"subcomando desconhecido: {name}")
+        cmd_help([], conf)
+        return 2
+    try:
+        return func(args, conf)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

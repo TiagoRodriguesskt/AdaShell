@@ -1,0 +1,13 @@
+[Scheme]
+Name=AdaOS
+ColorForeground=#F4EDE1
+ColorBackground=#000000
+ColorCursor=#CDA869
+ColorCursorUseDefault=FALSE
+ColorBold=#E2C189
+ColorBoldUseDefault=FALSE
+ColorSelection=#F4EDE1
+ColorSelectionBackground=#0F3D33
+ColorSelectionUseDefault=FALSE
+TabActivityColor=#CDA869
+ColorPalette=#0A2A23;#D0566B;#3FA77F;#CDA869;#5B9BD5;#A86FB5;#4FB3A9;#E8DFD0;#3C524B;#E07A8C;#6CC9A0;#E2C189;#86B8E6;#C493CF;#7FD1C7;#F4EDE1

@@ -1,0 +1,58 @@
+# Prompt do Terminal Inteligente — igual ao AdaOS:
+# (ambiente) usuário@máquina:pasta  main *+?  ⏱ 12s [1]$
+add_newline = false
+format = "$python$username$hostname[:](#F4EDE1)$directory$git_branch$git_status$cmd_duration$status$character"
+
+[python]
+format = '[\($virtualenv\) ]($style)'
+style = "#E2C189"
+detect_extensions = []
+detect_files = []
+
+[username]
+show_always = true
+format = "[$user]($style)"
+style_user = "bold #3FA77F"
+style_root = "bold #D0566B"
+
+[hostname]
+ssh_only = false
+format = "[@$hostname]($style)"
+style = "bold #3FA77F"
+
+[directory]
+format = "[$path]($style)[$read_only]($read_only_style)"
+style = "bold #5B9BD5"
+truncation_length = 4
+truncate_to_repo = false
+home_symbol = "~"
+read_only = " 🔒"
+
+[git_branch]
+format = "[ $branch]($style)"
+style = "#CDA869"
+
+[git_status]
+format = "[( $modified$staged$untracked$ahead_behind)]($style)"
+style = "#CDA869"
+modified = "*"
+staged = "+"
+untracked = "?"
+ahead = "⇡"
+behind = "⇣"
+diverged = "⇕"
+
+[cmd_duration]
+min_time = 3000
+format = "[ ⏱ $duration]($style)"
+style = "#8C9A94"
+
+[status]
+disabled = false
+format = '[ \[$status\]]($style)'
+style = "bold #D0566B"
+
+[character]
+format = "$symbol "
+success_symbol = '[\$](bold #CDA869)'
+error_symbol = '[\$](bold #D0566B)'
