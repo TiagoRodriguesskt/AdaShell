@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/).
 
+## [v3.13] — 2026-11-16
+`smart dino`: sons de verdade (pulo, ponto e batida), gerados pelo próprio jogo e tocados por `pw-play`/`paplay`/`aplay`, em vez do bipe do terminal (que vem desligado no Xfce); a escolha do `m` fica salva; aviso se não houver programa de áudio
+
+## [v3.12] — 2026-11-16
+Peso da IA local explicado no README e na documentação (tabela RAM × modelo); o instalador lê a RAM, recomenda o modelo (`1.5b`, `3b` ou nenhum abaixo de 4 GB) e avisa antes de instalar
+
 ## [v3.11] — 2026-11-16
 O instalador desliga as teclas de acesso aos menus do terminal (`ShortcutsNoMnemonics`), para o Alt+A e o Alt+E chegarem ao AdaShell em vez de abrir os menus Arquivo/Editar
 

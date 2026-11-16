@@ -2,7 +2,7 @@
 
 Um terminal no estilo do AdaOS que entende português, explica comandos, corrige erros e sugere enquanto você digita. Roda no Debian 12/13 com Xfce. A IA fica no próprio notebook (Ollama): depois de baixada, nada vai para a internet.
 
-Criado em 13/11/2026 (kit v1); atualizado em 13/11/2026 (kit v3.12, modelo de IA escolhido pela RAM da máquina). Testado com Fish 3.7 e uma IA simulada; o `smart update` foi testado no notebook (Debian 12) em 13/11/2026 e atualizou tudo.
+Criado em 13/11/2026 (kit v1); atualizado em 13/11/2026 (kit v3.13, sons de verdade no `smart dino`). Testado com Fish 3.7 e uma IA simulada; o `smart update` foi testado no notebook (Debian 12) em 13/11/2026 e atualizou tudo.
 
 ## Cola rápida (para decorar)
 
@@ -782,7 +782,7 @@ Inspirado no jogo do dinossauro do Chrome, com um **personagem próprio do AdaOS
 | **Espaço**, **↑** ou **w** | Pular (também começa e recomeça a partida). Se apertar até 0,15 s **antes** de pousar, ele pula assim que encostar no chão |
 | **↓** ou **s** | Abaixar: **segure** enquanto o pássaro passa; ao soltar, levanta em ~0,12 s. No ar: cai mais rápido |
 | **p** | Pausar / continuar |
-| **m** | Som liga/desliga (o "bip" do terminal) |
+| **m** | Som liga/desliga (a escolha fica salva para a próxima partida) |
 | **q** | Sair |
 
 **Obstáculos**
@@ -800,7 +800,7 @@ Inspirado no jogo do dinossauro do Chrome, com um **personagem próprio do AdaOS
 **O que acontece durante a partida**
 
 - A **velocidade aumenta** com a pontuação, até um limite.
-- A cada **100 pontos**, o placar pisca (e faz bip, se o som estiver ligado).
+- A cada **100 pontos**, o placar pisca (e toca um "plim", se o som estiver ligado).
 - A cada **700 pontos**, o dia vira **noite**: o sol dá lugar à lua e às estrelas. Depois de mais 700 pontos, amanhece.
 - O fundo tem **paralaxe**: as nuvens e as montanhas andam mais devagar que o chão, dando sensação de profundidade.
 - Ao bater, os olhos do dinossauro viram ✕ e aparece o placar. Se for recorde: **★ NOVO RECORDE! ★**
@@ -877,6 +877,7 @@ Por dentro (arquivo `~/.local/bin/adaos-dino`, separado do `adaos-smart`):
 | `Game.resize()` | Ajusta o jogo a um novo tamanho de janela sem perder a partida |
 | `Game.collides()` | Colisão: compara as células sólidas do dinossauro com as dos obstáculos |
 | `Game.draw()` | Desenha céu, nuvens, montanhas, chão, obstáculos, personagem e placar |
+| `tone()` / `Sound` | Gera os sons (ondas quadradas com a frequência variando, como nos videogames antigos), grava em `~/.cache/adaos/dino-sons/` e toca em segundo plano |
 | `main()` | O laço do jogo: lê o teclado, atualiza, desenha e espera o próximo quadro. A espera é feita com `getch()` e um tempo limite, então uma tecla acorda o jogo na hora |
 | `curses` | A biblioteca do Python que desenha no terminal (já vem com o Python) |
 
@@ -1121,7 +1122,7 @@ Fonte: **JetBrains Mono 11**.
 | `smart dino`: desenhos com falhas ou desalinhados | Use a fonte JetBrains Mono (o `instalar.sh` já configura) ou outra fonte monoespaçada com os caracteres de bloco (▄ █ ▀) |
 | `smart dino`: um toque rápido em ↓ deixa o dino abaixado ~0,5 s | É de propósito: o terminal não avisa quando a tecla é solta, então o 1º toque dura até o teclado começar a repetir. **Segure** ↓: ao soltar, ele levanta em ~0,12 s |
 | `smart dino`: ainda sinto um pequeno atraso na tecla | Parte do atraso vem do próprio terminal. No xfce4-terminal, desligar a transparência e as animações do Xfce ajuda. Abaixar com ↓ tem ~25 ms a mais que o Espaço, porque as setas são sequências de teclas |
-| `smart dino`: o som não toca | O som é o "bip" do terminal (tecla `m`). No xfce4-terminal, ative em Preferências → Avançado → "Bipe audível" |
+| `smart dino`: o som não toca | Aperte `m` (o rodapé mostra "som (ligado)"). O jogo toca os efeitos pelo sistema de áudio com `pw-play`, `paplay` ou `aplay`; se nenhum existir, aparece o aviso. Instale com `sudo apt install pipewire-bin` (ou `pulseaudio-utils`). Confira também o volume do sistema |
 | No `smart pure` aparecem linhas começando com `+` | Você digitou `set -x` (jeito do Fish de criar variável). No Bash, isso liga o modo de depuração. Desligue com `set +x` e use `export NOME=valor` |
 | No `smart pure`, o ↑ não mostra meus comandos de sempre | É de propósito: o treino tem histórico próprio (`~/.config/adaos/pure_history`) |
 | `smart update` mostra **✗ Exemplos do tldr: falhou** | O tealdeer do Debian 12 (versão 1.5.0) baixa os exemplos de um endereço antigo, que o projeto tldr-pages desativou. Corrigido no kit v2.2: o `smart update` instala o tealdeer novo (≥ 1.7.3) do GitHub em `~/.local/bin/tldr` e atualiza os exemplos. Confira com `tldr --version` |
@@ -1181,6 +1182,7 @@ Depois de editar, abra um terminal novo para testar. Para editar o kit e reinsta
 
 | Versão | O que mudou |
 | --- | --- |
+| v3.13 (16/11/2026) | `smart dino`: sons de verdade (pulo, ponto e batida), gerados pelo próprio jogo e tocados por `pw-play`/`paplay`/`aplay`, em vez do bipe do terminal (que vem desligado no Xfce); a escolha do `m` fica salva; aviso se não houver programa de áudio |
 | v3.12 (16/11/2026) | Peso da IA local explicado no README e na documentação (tabela RAM × modelo); o instalador lê a RAM, recomenda o modelo (`1.5b`, `3b` ou nenhum abaixo de 4 GB) e avisa antes de instalar |
 | v3.11 (16/11/2026) | O instalador desliga as teclas de acesso aos menus do terminal (`ShortcutsNoMnemonics`), para o Alt+A e o Alt+E chegarem ao AdaShell em vez de abrir os menus Arquivo/Editar |
 | v3.10 (16/11/2026) | `smart explain`, `smart ask`, `smart fix` e `smart learn explain/ask/fix` passam a funcionar (com dica do jeito curto); mensagem de "aula não encontrada" sugere `explain` |

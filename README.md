@@ -56,7 +56,24 @@ Executar? [s/N]
 
 - **Debian 12/13 com Xfce** (funciona em outras distros baseadas em Debian; o essencial é o shell **Fish**).
 - Acesso a `sudo` para instalar os pacotes.
-- **Opcional:** [Ollama](https://ollama.com) para a IA (`ask`, `explain`, `fix`) — cerca de 2 GB. O instalador oferece instalar.
+- **Opcional:** [Ollama](https://ollama.com) para a IA (`ask`, `explain`, `fix`). Veja abaixo quanto ela pesa antes de instalar.
+
+## IA local: quanto pesa
+
+O AdaShell **não traz uma IA embutida**: ele conversa com o [Ollama](https://ollama.com), que roda um modelo de linguagem **no seu próprio computador** (processador e memória RAM). Isso tem custo, então escolha o modelo pelo tamanho da sua máquina:
+
+| RAM do computador | Modelo recomendado | Download | Observação |
+| --- | --- | --- | --- |
+| Menos de 4 GB | **não instale a IA** | — | O resto do AdaShell funciona sem ela |
+| 4 a 8 GB | `qwen2.5-coder:1.5b` | ~1 GB | Mais simples, mas leve |
+| 8 a 16 GB | `qwen2.5-coder:3b` (padrão) | ~2 GB | Bom equilíbrio |
+| 16 GB ou mais | `qwen2.5-coder:3b` ou `qwen2.5-coder:7b` | ~2 / ~4,7 GB | O 7b é mais esperto e mais lento |
+
+- **O instalador escolhe sozinho:** ele lê a RAM da máquina, mostra o modelo recomendado e só então pergunta se você quer instalar. Com menos de 4 GB, recomenda não instalar e pede confirmação extra.
+- **Não precisa de placa de vídeo**: roda no processador. Com GPU compatível, o Ollama usa e fica mais rápido.
+- **Enquanto responde**, o modelo ocupa RAM e processador (o computador pode ficar mais lento por alguns segundos). Depois de ~5 minutos sem uso, o Ollama libera a memória.
+- **Modelos grandes (13b, 30b, 70b…) não são recomendados** para notebooks: podem travar o sistema. Para o que o AdaShell faz (comandos curtos), o 3b já basta.
+- Trocar de modelo: `ollama pull <modelo>` e `smart model <modelo>`. Desligar a IA: `sudo systemctl stop ollama`.
 
 ## Instalação
 
@@ -66,7 +83,7 @@ cd AdaShell
 bash instalar.sh
 ```
 
-Rode **sem `sudo`** (o script pede a senha só quando precisa). Ele pergunta se você quer a IA local. Ao terminar, **feche e abra o terminal** e confira:
+Rode **sem `sudo`** (o script pede a senha só quando precisa). Ele mostra a RAM da máquina, o modelo de IA recomendado e pergunta se você quer instalar. Ao terminar, **feche e abra o terminal** e confira:
 
 ```fish
 smart status      # a IA está pronta?
@@ -141,7 +158,7 @@ Nada é executado sem a sua confirmação.
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
 ```
 
-Um dinossauro steampunk corre por um mundo de engrenagens. **Espaço** pula, **↓** abaixa, **q** sai. A física do pulo foi calibrada pelas constantes do jogo original do Chrome, e a altura se ajusta ao tamanho da janela. Tem dia e noite, recorde salvo e pausa. O código (`bin/adaos-dino`) é um bom exemplo de jogo em `curses` para estudar.
+Um dinossauro steampunk corre por um mundo de engrenagens. **Espaço** pula, **↓** abaixa, **q** sai. A física do pulo foi calibrada pelas constantes do jogo original do Chrome, e a altura se ajusta ao tamanho da janela. Tem dia e noite, sons (tecla **m**), recorde salvo e pausa. O código (`bin/adaos-dino`) é um bom exemplo de jogo em `curses` para estudar.
 
 ## Desinstalar
 
