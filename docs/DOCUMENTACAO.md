@@ -2,7 +2,7 @@
 
 Um terminal no estilo do AdaOS que entende português, explica comandos, corrige erros e sugere enquanto você digita. Roda no Debian 12/13 com Xfce. A IA fica no próprio notebook (Ollama): depois de baixada, nada vai para a internet.
 
-Criado em 13/11/2026 (kit v1); atualizado em 13/11/2026 (kit v3.11, Alt+A/Alt+E não abrem mais os menus do terminal). Testado com Fish 3.7 e uma IA simulada; o `smart update` foi testado no notebook (Debian 12) em 13/11/2026 e atualizou tudo.
+Criado em 13/11/2026 (kit v1); atualizado em 13/11/2026 (kit v3.12, modelo de IA escolhido pela RAM da máquina). Testado com Fish 3.7 e uma IA simulada; o `smart update` foi testado no notebook (Debian 12) em 13/11/2026 e atualizou tudo.
 
 ## Cola rápida (para decorar)
 
@@ -125,7 +125,20 @@ O Terminal Inteligente junta três camadas:
 | --- | --- | --- |
 | Shell | **Fish** | Sugestões em cinza pelo histórico, cores que mostram se o comando existe, Tab inteligente |
 | Ferramentas | **starship**, **fzf**, **zoxide**, **bat**, **eza/exa**, **fd**, **tldr**, **fastfetch** | Prompt do AdaOS, buscas, pular de pasta, listagens e leitura com cores |
-| IA local | **Ollama** + modelo `qwen2.5-coder:3b` + **adaos-smart** (Python) | `ask`, `explain`, `fix`, Alt+A e Alt+E |
+| IA local (opcional) | **Ollama** + um modelo de linguagem (escolhido pela RAM, veja abaixo) + **adaos-smart** (Python) | `ask`, `explain`, `fix`, Alt+A e Alt+E |
+
+> ### 🧠 Qual modelo de IA o AdaShell usa?
+>
+> O AdaShell **não traz uma IA embutida**. Ele usa o **Ollama**, que roda um modelo de linguagem **no seu próprio computador**, gastando processador e memória RAM. O instalador lê a RAM e escolhe o modelo:
+>
+> | RAM do computador | Modelo | Download |
+> | --- | --- | --- |
+> | Menos de 4 GB | **nenhum** (não instale a IA) | — |
+> | 4 a 8 GB | `qwen2.5-coder:1.5b` | ~1 GB |
+> | 8 a 16 GB | **`qwen2.5-coder:3b`** (padrão) | ~2 GB |
+> | 16 GB ou mais | `qwen2.5-coder:3b` ou `qwen2.5-coder:7b` | ~2 / ~4,7 GB |
+>
+> **Não use modelos grandes (13b, 30b, 70b…) em notebook**: podem travar o sistema. Ver o modelo em uso: `smart model` · trocar: `smart model <nome>` · detalhes na seção 9.
 
 Segue as regras do AdaOS: **comandos em inglês** (`ask`, `explain`, `fix`, `smart`), **mensagens em português**, todo comando aceita `help`, visual escuro (esmeralda, bronze, vinho e marfim).
 
@@ -1010,19 +1023,27 @@ TIMEOUT=120
 
 Editar: `code ~/.config/adaos/smart.conf`
 
-### Escolher o modelo
+### Escolher o modelo (quanto pesa a IA local)
 
-| Modelo | Tamanho | Quando usar |
-| --- | --- | --- |
-| `qwen2.5-coder:3b` (padrão) | ~2 GB | Rápido no processador; bom para comandos do dia a dia |
-| `qwen2.5-coder:7b` | ~4,7 GB | Mais esperto em comandos complicados; responde mais devagar |
+O AdaShell não traz uma IA embutida: ele usa o **Ollama**, que roda o modelo **neste computador** (processador + RAM). O instalador lê a RAM e escolhe:
+
+| RAM do computador | Modelo | Download | Observação |
+| --- | --- | --- | --- |
+| Menos de 4 GB | **não instale** | — | O instalador recomenda não instalar e pede `SIM` para continuar (usa o `0.5b`) |
+| 4 a 8 GB | `qwen2.5-coder:1.5b` | ~1 GB | Leve |
+| 8 a 16 GB | `qwen2.5-coder:3b` (padrão) | ~2 GB | Bom equilíbrio |
+| 16 GB ou mais | `qwen2.5-coder:3b` ou `:7b` | ~2 / ~4,7 GB | O 7b é mais esperto e mais lento |
 
 ```fish
 ollama pull qwen2.5-coder:7b
 smart model qwen2.5-coder:7b
 ```
 
-Com 32 GB de RAM, os dois cabem com folga; a diferença está na velocidade do processador.
+Cuidados:
+- Roda no processador; placa de vídeo não é necessária.
+- Enquanto responde, o modelo usa RAM e processador; depois de ~5 minutos sem uso, o Ollama libera a memória.
+- **Não use modelos grandes (13b, 30b, 70b…) num notebook**: podem travar o sistema. Para comandos curtos, o 3b basta.
+- Para liberar tudo na hora: `sudo systemctl stop ollama`.
 
 ### Outras opções
 
@@ -1160,6 +1181,7 @@ Depois de editar, abra um terminal novo para testar. Para editar o kit e reinsta
 
 | Versão | O que mudou |
 | --- | --- |
+| v3.12 (16/11/2026) | Peso da IA local explicado no README e na documentação (tabela RAM × modelo); o instalador lê a RAM, recomenda o modelo (`1.5b`, `3b` ou nenhum abaixo de 4 GB) e avisa antes de instalar |
 | v3.11 (16/11/2026) | O instalador desliga as teclas de acesso aos menus do terminal (`ShortcutsNoMnemonics`), para o Alt+A e o Alt+E chegarem ao AdaShell em vez de abrir os menus Arquivo/Editar |
 | v3.10 (16/11/2026) | `smart explain`, `smart ask`, `smart fix` e `smart learn explain/ask/fix` passam a funcionar (com dica do jeito curto); mensagem de "aula não encontrada" sugere `explain` |
 | v3.9 (16/11/2026) | `smart learn` conferido: busca acerta a palavra exata (`ip` não abre mais "pipe") e entende palavras do dia a dia; não quebra com progresso corrompido; mensagem ao terminar as 27 aulas; aulas corrigidas: 6 (o `/var/log/syslog` não existe no Debian 12 → `tail -f arquivo.log`), 12 (exercício do `history` no fish e no bash), 13 (linha `#!/bin/bash`), 18 (fish e bash separados), 19 (atalhos com ⌨), 26 (`xargs` seguro com espaços) |
